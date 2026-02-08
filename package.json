@@ -1,0 +1,8 @@
+{
+  "name": "contextfs-repo",
+  "private": true,
+  "scripts": {
+    "test:contextfs:unit": "npm test --prefix .opencode/plugins/contextfs",
+    "test:contextfs:regression": "node scripts/regression-contextfs.mjs"
+  }
+}

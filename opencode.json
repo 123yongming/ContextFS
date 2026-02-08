@@ -1,0 +1,12 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "plugin": [
+    "file:///D:/code/python_code/ContextFS/.opencode/plugins/contextfs.plugin.mjs"
+  ],
+  "command": {
+    "ctx": {
+      "description": "ContextFS: ls/cat/pin/pack/compact",
+      "template": "You are running /ctx.\n\nRules:\n- Do NOT run bash.\n- Use the `contextfs` tool exactly once.\n\nUser arguments: $ARGUMENTS\n\nCall:\ncontextfs({ \"cmd\": \"$ARGUMENTS\" })\n\nReturn the tool result verbatim."
+    }
+  }
+}
