@@ -3,6 +3,9 @@
   "private": true,
   "scripts": {
     "test:contextfs:unit": "npm test --prefix .opencode/plugins/contextfs",
-    "test:contextfs:regression": "node scripts/regression-contextfs.mjs"
+    "test:contextfs:regression": "node scripts/regression-contextfs.mjs",
+    "bench:e2e": "node bench/bench_e2e.mjs",
+    "bench:naive": "node bench/bench_naive.mjs",
+    "bench": "node bench/bench.mjs"
   }
 }
