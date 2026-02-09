@@ -12,53 +12,70 @@ function countHistoryTokens(history) {
 }
 
 export async function maybeCompact(storage, config, force = false) {
-  const history = await storage.readHistory();
-  const pins = await storage.readText("pins");
-  const summary = await storage.readText("summary");
-  const total = countHistoryTokens(history) + estimateTokens(pins) + estimateTokens(summary);
+  const lock = await storage.acquireLock();
+  let result;
+  try {
+    const history = await storage.readHistory();
+    const pins = await storage.readText("pins");
+    const summary = await storage.readText("summary");
+    const total = countHistoryTokens(history) + estimateTokens(pins) + estimateTokens(summary);
 
-  const threshold = config.tokenThreshold;
-  const shouldCompact = force || (config.autoCompact && total > threshold);
-  if (!shouldCompact) {
-    return {
-      compacted: false,
-      beforeTokens: total,
-      afterTokens: total,
-      compactedTurns: 0,
-    };
+    const threshold = config.tokenThreshold;
+    const shouldCompact = force || (config.autoCompact && total > threshold);
+    if (!shouldCompact) {
+      result = {
+        compacted: false,
+        beforeTokens: total,
+        afterTokens: total,
+        compactedTurns: 0,
+      };
+    } else {
+      const keep = Math.max(1, Number(config.recentTurns || 6));
+      const splitIndex = Math.max(0, history.length - keep);
+      const oldTurns = history.slice(0, splitIndex);
+      const recentTurns = history.slice(splitIndex);
+
+      if (!oldTurns.length && !force) {
+        result = {
+          compacted: false,
+          beforeTokens: total,
+          afterTokens: total,
+          compactedTurns: 0,
+        };
+      } else {
+        const bullets = summarizeTurns(oldTurns, 20);
+        const merged = mergeSummary(summary, bullets, config.summaryMaxChars);
+        const now = new Date().toISOString();
+        const historyText = recentTurns.map((item) => JSON.stringify(item)).join("\n");
+
+        await storage.writeTextWithLock("summary", merged);
+        await storage.writeTextWithLock("history", historyText ? `${historyText}\n` : "");
+
+        const currentState = await storage.readState();
+        const nextState = {
+          ...currentState,
+          revision: (currentState.revision || 0) + 1,
+          updatedAt: now,
+          lastCompactedAt: now,
+          lastPackTokens: countHistoryTokens(recentTurns) + estimateTokens(pins) + estimateTokens(merged),
+        };
+        await storage.writeTextWithLock("state", JSON.stringify(nextState, null, 2) + "\n");
+
+        result = {
+          compacted: true,
+          beforeTokens: total,
+          afterTokens: nextState.lastPackTokens,
+          compactedTurns: oldTurns.length,
+          keptTurns: recentTurns.length,
+        };
+      }
+    }
+  } finally {
+    await storage.releaseLock(lock);
   }
 
-  const keep = Math.max(1, Number(config.recentTurns || 6));
-  const splitIndex = Math.max(0, history.length - keep);
-  const oldTurns = history.slice(0, splitIndex);
-  const recentTurns = history.slice(splitIndex);
-
-  if (!oldTurns.length && !force) {
-    return {
-      compacted: false,
-      beforeTokens: total,
-      afterTokens: total,
-      compactedTurns: 0,
-    };
+  if (result?.compacted) {
+    await storage.refreshManifest();
   }
-
-  const bullets = summarizeTurns(oldTurns, 20);
-  const merged = mergeSummary(summary, bullets, config.summaryMaxChars);
-  await storage.writeText("summary", merged);
-  await storage.writeHistory(recentTurns);
-
-  const afterTotal = countHistoryTokens(recentTurns) + estimateTokens(pins) + estimateTokens(merged);
-  await storage.updateState({
-    lastCompactedAt: new Date().toISOString(),
-    lastPackTokens: afterTotal,
-  });
-  await storage.refreshManifest();
-
-  return {
-    compacted: true,
-    beforeTokens: total,
-    afterTokens: afterTotal,
-    compactedTurns: oldTurns.length,
-    keptTurns: recentTurns.length,
-  };
+  return result;
 }

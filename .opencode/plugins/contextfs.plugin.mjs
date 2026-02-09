@@ -1,5 +1,3 @@
-console.error("[contextfs] loaded", { cwd: process.cwd() });
-
 import fs from "node:fs";
 import path from "node:path";
 
@@ -10,7 +8,10 @@ import { buildContextPack } from "./contextfs/src/packer.mjs";
 import { addPinsFromText } from "./contextfs/src/pins.mjs";
 import { runCtxCommand } from "./contextfs/src/commands.mjs";
 
-function dbg(workspaceDir, msg, obj) {
+function dbg(workspaceDir, enabled, msg, obj) {
+  if (!enabled) {
+    return;
+  }
   try {
     const p = path.join(workspaceDir, ".contextfs", "debug.log");
     fs.mkdirSync(path.dirname(p), { recursive: true });
@@ -20,6 +21,18 @@ function dbg(workspaceDir, msg, obj) {
       "\n";
     fs.appendFileSync(p, line, "utf8");
   } catch {}
+}
+
+async function safeRun(workspaceDir, enabled, label, run) {
+  try {
+    return await run();
+  } catch (err) {
+    dbg(workspaceDir, enabled, `safeRun:${label}:error`, {
+      message: String(err?.message || err),
+      stack: String(err?.stack || ""),
+    });
+    return undefined;
+  }
 }
 
 function textFromMessage(payload) {
@@ -103,10 +116,12 @@ async function recordTurn(storage, role, text) {
 }
 
 export const ContextFSPlugin = async ({ directory }) => {
-  console.error("[contextfs] init", { directory, cwd: process.cwd() });
   const config = mergeConfig(globalThis.CONTEXTFS_CONFIG || {});
   const workspaceDir = directory || process.cwd();
-  dbg(workspaceDir, "init", { directory, cwd: process.cwd(), url: import.meta.url });
+  const debugEnabled = Boolean(config.debug) || process.env.CONTEXTFS_DEBUG === "1";
+  const logDebug = (msg, obj) => dbg(workspaceDir, debugEnabled, msg, obj);
+  logDebug("init", { directory, cwd: process.cwd(), url: import.meta.url });
+
   const storage = new ContextFsStorage(workspaceDir, config);
   await storage.ensureInitialized();
 
@@ -139,166 +154,166 @@ export const ContextFSPlugin = async ({ directory }) => {
     await maybeCompact(storage, config, false);
   }
 
-  return {
-event: async (payload) => {
-  const evt = payload?.event || payload || {};
-  const type = evt.type || evt.name || payload?.type || payload?.name || "unknown";
-  const props = evt.properties || evt.props || payload?.properties || {};
+  async function handleEvent(payload) {
+    const evt = payload?.event || payload || {};
+    const type = evt.type || evt.name || payload?.type || payload?.name || "unknown";
+    const props = evt.properties || evt.props || payload?.properties || {};
 
-  // Streaming delta updates: accumulate and flush on message.updated when completed
-  if (type === "message.part.updated") {
-    const part = props.part || {};
-    const delta = props.delta;
+    // Streaming delta updates: accumulate and flush on message.updated when completed
+    if (type === "message.part.updated") {
+      const part = props.part || {};
+      const delta = props.delta;
 
-    const msgId =
-      part.messageID ||
-      part.messageId ||
-      part.id ||
-      delta?.messageID ||
-      delta?.messageId ||
-      null;
+      const msgId =
+        part.messageID ||
+        part.messageId ||
+        part.id ||
+        delta?.messageID ||
+        delta?.messageId ||
+        null;
 
-    const deltaText = extractDeltaText(delta);
+      const deltaText = extractDeltaText(delta);
 
-    if (msgId && deltaText) {
-      const prev = streamBuf.get(msgId) || { text: "", updatedAt: Date.now() };
-      prev.text += deltaText;
-      prev.updatedAt = Date.now();
-      streamBuf.set(msgId, prev);
-    } else {
-      partEventCount += 1;
-      if (partEventCount % 100 === 0) {
-        dbg(workspaceDir, "message.part.updated missing", {
-          msgId,
-          partKeys: part ? Object.keys(part) : [],
-          deltaKeys: delta && typeof delta === "object" ? Object.keys(delta) : [],
-          deltaSample: JSON.stringify(delta).slice(0, 400),
-        });
+      if (msgId && deltaText) {
+        const prev = streamBuf.get(msgId) || { text: "", updatedAt: Date.now() };
+        prev.text += deltaText;
+        prev.updatedAt = Date.now();
+        streamBuf.set(msgId, prev);
+      } else {
+        partEventCount += 1;
+        if (partEventCount % 100 === 0) {
+          logDebug("message.part.updated missing", {
+            msgId,
+            partKeys: part ? Object.keys(part) : [],
+            deltaKeys: delta && typeof delta === "object" ? Object.keys(delta) : [],
+            deltaSample: JSON.stringify(delta).slice(0, 400),
+          });
+        }
       }
-    }
-    return;
-  }
-
-  // Log non-stream events (keeps debug.log readable)
-  dbg(workspaceDir, "event", { type, propKeys: Object.keys(props || {}) });
-
-  if (type === "session.created") {
-    await storage.ensureInitialized();
-    await storage.refreshManifest();
-    return;
-  }
-
-  if (type === "session.diff") {
-    // Often contains tool calls and message content; log a small sample for inspection
-    const diff = props.diff;
-    dbg(workspaceDir, "session.diff sample", {
-      diffKeys: diff && typeof diff === "object" ? Object.keys(diff) : [],
-      sample: JSON.stringify(diff).slice(0, 1200),
-    });
-    return;
-  }
-
-  if (type === "message.updated") {
-    // In opencode 1.1.53, message.updated often contains only metadata under properties.info.
-    const info = props.info || props.message?.info || props;
-    const msgId = getMsgIdFromInfo(info);
-    const role = info?.role || "unknown";
-    const finished = info?.finish === "stop" || Boolean(info?.time?.completed);
-
-    if (finished && msgId && streamBuf.has(msgId)) {
-      const buf = streamBuf.get(msgId);
-      streamBuf.delete(msgId);
-
-      const text = String(buf?.text || "").trim();
-      if (!text) {
-        dbg(workspaceDir, "message.updated flush EMPTY", { msgId, role });
-        return;
-      }
-
-      await recordTurn(storage, role, text);
-      await addPinsFromText(storage, text, config);
-      await autoCompactIfNeeded();
-      await storage.refreshManifest();
       return;
     }
 
-    // Fallback: some user messages only provide summary.title
-    const title = info?.summary?.title;
-    if (role === "user" && title) {
-      const fallback = `[user-summary] ${title}`;
-      await recordTurn(storage, "user", fallback);
-      await autoCompactIfNeeded();
-      await storage.refreshManifest();
-      return;
-    }
+    logDebug("event", { type, propKeys: Object.keys(props || {}) });
 
-    dbg(workspaceDir, "message.updated no-text", {
-      msgId,
-      role,
-      finished,
-      infoKeys: info ? Object.keys(info) : [],
-      sample: JSON.stringify(info).slice(0, 800),
-    });
-    return;
-  }
-
-  // Tool events vary by version; log their shapes for later parsing.
-  if (String(type).includes("tool") || String(type).startsWith("bash")) {
-    dbg(workspaceDir, "tool-like event", {
-      type,
-      sample: JSON.stringify(props).slice(0, 1200),
-    });
-  }
-},
-    "session.created": async () => {
+    if (type === "session.created") {
       await storage.ensureInitialized();
       await storage.refreshManifest();
-    },
+      return;
+    }
 
-    "message.updated": async (input) => {
-      const evt = input?.event || input || {};
-      const props = evt.properties || evt.props || input?.properties || {};
-      const msg = props.message || props.msg || props.data || (evt.type ? props : evt);
-      const role = roleFromMessage(msg, "message");
-      const text = textFromMessage(msg);
-      await recordTurn(storage, role, text);
-      await addPinsFromText(storage, text, config);
-      await autoCompactIfNeeded();
-      await storage.refreshManifest();
-    },
+    if (type === "session.diff") {
+      const diff = props.diff;
+      logDebug("session.diff sample", {
+        diffKeys: diff && typeof diff === "object" ? Object.keys(diff) : [],
+        sample: JSON.stringify(diff).slice(0, 1200),
+      });
+      return;
+    }
 
-    "tool.execute.after": async (input, output) => {
-      const commandText = textFromMessage(input?.args || input);
-      const resultText = textFromMessage(output);
-      const merged = [commandText, resultText].filter(Boolean).join("\n");
-      if (merged) {
-        await recordTurn(storage, "tool", merged);
-        await addPinsFromText(storage, merged, config);
-      }
-      await autoCompactIfNeeded();
-      await storage.refreshManifest();
-    },
+    if (type === "message.updated") {
+      const info = props.info || props.message?.info || props;
+      const msgId = getMsgIdFromInfo(info);
+      const role = info?.role || "unknown";
+      const finished = info?.finish === "stop" || Boolean(info?.time?.completed);
 
-    "tui.prompt.append": async (_input, output) => {
-      if (!config.autoInject) {
+      if (finished && msgId && streamBuf.has(msgId)) {
+        const buf = streamBuf.get(msgId);
+        streamBuf.delete(msgId);
+
+        const text = String(buf?.text || "").trim();
+        if (!text) {
+          logDebug("message.updated flush EMPTY", { msgId, role });
+          return;
+        }
+
+        await recordTurn(storage, role, text);
+        await addPinsFromText(storage, text, config);
+        await autoCompactIfNeeded();
+        await storage.refreshManifest();
         return;
       }
-      const pack = await buildContextPack(storage, config);
-      appendPrompt(output, pack.block);
-      await storage.refreshManifest();
-    },
 
-    "tui.command.execute": async (input, output) => {
-      const raw =
-        input?.command ||
-        input?.text ||
-        (typeof input === "string" ? input : "");
-      if (!String(raw).trim().startsWith("ctx")) {
+      // Fallback: some user messages only provide summary.title
+      const title = info?.summary?.title;
+      if (role === "user" && title) {
+        const fallback = `[user-summary] ${title}`;
+        await recordTurn(storage, "user", fallback);
+        await autoCompactIfNeeded();
+        await storage.refreshManifest();
         return;
       }
-      const result = await runCtxCommand(raw, storage, config);
-      setCommandOutput(output, result);
-    },
+
+      logDebug("message.updated no-text", {
+        msgId,
+        role,
+        finished,
+        infoKeys: info ? Object.keys(info) : [],
+        sample: JSON.stringify(info).slice(0, 800),
+      });
+      return;
+    }
+
+    // Tool events vary by version; log their shapes for later parsing.
+    if (String(type).includes("tool") || String(type).startsWith("bash")) {
+      logDebug("tool-like event", {
+        type,
+        sample: JSON.stringify(props).slice(0, 1200),
+      });
+    }
+  }
+
+  return {
+    event: async (payload) => safeRun(workspaceDir, debugEnabled, "event", async () => handleEvent(payload)),
+    "session.created": async () =>
+      safeRun(workspaceDir, debugEnabled, "session.created", async () => {
+        await storage.ensureInitialized();
+        await storage.refreshManifest();
+      }),
+    "message.updated": async (input) =>
+      safeRun(workspaceDir, debugEnabled, "message.updated", async () => {
+        const evt = input?.event || input || {};
+        const props = evt.properties || evt.props || input?.properties || {};
+        const msg = props.message || props.msg || props.data || (evt.type ? props : evt);
+        const role = roleFromMessage(msg, "message");
+        const text = textFromMessage(msg);
+        await recordTurn(storage, role, text);
+        await addPinsFromText(storage, text, config);
+        await autoCompactIfNeeded();
+        await storage.refreshManifest();
+      }),
+    "tool.execute.after": async (input, output) =>
+      safeRun(workspaceDir, debugEnabled, "tool.execute.after", async () => {
+        const commandText = textFromMessage(input?.args || input);
+        const resultText = textFromMessage(output);
+        const merged = [commandText, resultText].filter(Boolean).join("\n");
+        if (merged) {
+          await recordTurn(storage, "tool", merged);
+          await addPinsFromText(storage, merged, config);
+        }
+        await autoCompactIfNeeded();
+        await storage.refreshManifest();
+      }),
+    "tui.prompt.append": async (_input, output) =>
+      safeRun(workspaceDir, debugEnabled, "tui.prompt.append", async () => {
+        if (!config.autoInject) {
+          return;
+        }
+        const pack = await buildContextPack(storage, config);
+        appendPrompt(output, pack.block);
+        await storage.refreshManifest();
+      }),
+    "tui.command.execute": async (input, output) =>
+      safeRun(workspaceDir, debugEnabled, "tui.command.execute", async () => {
+        const raw =
+          input?.command ||
+          input?.text ||
+          (typeof input === "string" ? input : "");
+        if (!String(raw).trim().startsWith("ctx")) {
+          return;
+        }
+        const result = await runCtxCommand(raw, storage, config);
+        setCommandOutput(output, result);
+      }),
   };
 };
 
