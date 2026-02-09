@@ -1,94 +1,122 @@
 # ContextFS
 
-ContextFS 是一个给 OpenCode 使用的“小而精”上下文插件 MVP，目标是让长会话保持稳定上下文体积，降低变慢与跑偏。
+ContextFS 是一个为 OpenCode 设计的轻量级上下文管理插件，解决长会话中"上下文体积膨胀导致变慢/跑偏"的问题。
 
-## 已实现内容（MVP）
+## 核心功能
 
-- 插件目录：`.opencode/plugins/contextfs/`
-- 自动落盘：首次运行自动创建 `.contextfs/`
-- 每轮固定 Context Pack：`pins + summary + manifest + recent N`
-- 自动 compact：超阈值时压缩旧历史，保留最近工作集
-- pins 维护：保守抽取 + 手动 pin + 去重
-- 命令入口：`ctx ls|cat|pin|compact|gc`
-- 最小测试：token 估算、pins 去重、summary merge、存储并发/原子写
+### 1. 上下文结构化管理
+在 `.contextfs/` 目录维护 4 类关键文件：
 
-## 目录
+| 文件 | 用途 |
+|------|------|
+| `manifest.md` | 项目结构和待办事项清单 |
+| `pins.md` | 关键约束/规则的固定记忆 |
+| `summary.md` | 历史对话的滚动摘要（压缩后的旧历史） |
+| `history.ndjson` | 最近 N 轮对话的详细记录 |
 
-```text
-.
-|- opencode.json                         # OpenCode 项目配置（注册 /ctx 命令）
-|- .opencode/
-|  |- tools/
-|  |  |- contextfs.ts                    # ContextFS 工具桥接（调用 CLI）
-|  |- plugins/
-|     |- contextfs.plugin.mjs            # OpenCode 插件入口
-|     |- contextfs/
-|        |- cli.mjs                      # 本地手动验收 CLI
-|        |- src/                         # 核心实现
-|        |- test/                        # 最小测试
-|        |- README.md                    # 插件详细说明
-|- .contextfs/                           # 运行后自动生成的上下文数据
+### 2. 智能上下文 Pack
+每轮对话自动组装结构化的 Context Pack：
+
 ```
+<<<CONTEXTFS:BEGIN>>>
+# PINS (关键约束，最多 20 条)
+# SUMMARY (滚动摘要，最多 3200 字符)
+# MANIFEST (项目结构，最多 20 行)
+# WORKSET (最近 6 轮对话)
+<<<CONTEXTFS:END>>>
+```
+
+### 3. 自动压缩机制
+- 当估算 token 数超过阈值（默认 8000）时自动触发
+- 将旧历史压缩成 bullet points 并入 `summary.md`
+- 只保留最近 N 轮完整对话，保证上下文体积始终可控
+
+### 4. Pins 管理
+- 手动添加关键约束
+- 自动去重（完全重复和前缀重复）
+- 持久化存储，跨会话保留
 
 ## 快速开始
 
-1) 运行最小验证：
-
-```bash
-cd .opencode/plugins/contextfs
-npm test
-```
-
-2) 回到仓库根目录执行命令验收：
-
-```bash
-node .opencode/plugins/contextfs/cli.mjs ls
-node .opencode/plugins/contextfs/cli.mjs pin "必须不改 OpenCode 核心架构"
-node .opencode/plugins/contextfs/cli.mjs compact
-node .opencode/plugins/contextfs/cli.mjs pack
-```
-
-3) 查看 `.contextfs/` 是否按预期更新：
-
-- `manifest.md`
-- `pins.md`
-- `summary.md`
-- `history.ndjson`
-
-## 测试方式
-
-在仓库根目录执行：
-
-```bash
-# 插件单元测试（node:test）
-npm run test:contextfs:unit
-
-# 6 项隔离回归测试（一键）
-npm run test:contextfs:regression
-```
-
-说明：
-
-- `test:contextfs:unit` 会执行 `.opencode/plugins/contextfs/test/contextfs.test.mjs`。
-- `test:contextfs:regression` 会运行 `scripts/regression-contextfs.mjs`，自动在 `.contextfs_rt_*` 目录重建隔离环境并输出 PASS/FAIL 表与 JSON 摘要。
-
-## OpenCode 插件加载
-
-当前仓库已按 OpenCode 常见方式放置：插件、工具桥接和配置都放在 `.opencode/` 与 `opencode.json` 下。
-
-关键位置：
-
-- 插件入口：`.opencode/plugins/contextfs.plugin.mjs`
-- 插件实现：`.opencode/plugins/contextfs/`
-- 工具桥接：`.opencode/tools/contextfs.ts`
-- 命令配置：`opencode.json`（`ctx` 命令模板）
-
-示例：
+### 安装
 
 ```bash
 mkdir -p .opencode/plugins
-cp <path-to-contextfs-repo>/.opencode/plugins/contextfs.plugin.mjs .opencode/plugins/contextfs.plugin.mjs
-cp -r <path-to-contextfs-repo>/.opencode/plugins/contextfs .opencode/plugins/contextfs
+cp <path-to-contextfs>/.opencode/plugins/contextfs.plugin.mjs .opencode/plugins/
+cp -r <path-to-contextfs>/.opencode/plugins/contextfs .opencode/plugins/
 ```
 
-更多配置项、手动验收步骤见：`.opencode/plugins/contextfs/README.md`
+### 使用
+
+```bash
+# 查看状态
+node .opencode/plugins/contextfs/cli.mjs ls
+
+# 添加关键约束
+node .opencode/plugins/contextfs/cli.mjs pin "不要修改核心架构"
+
+# 手动压缩
+node .opencode/plugins/contextfs/cli.mjs compact
+
+# 查看当前 Pack
+node .opencode/plugins/contextfs/cli.mjs pack
+```
+
+## 项目结构
+
+```text
+.
+├── opencode.json                         # OpenCode 项目配置
+├── .opencode/
+│   ├── tools/
+│   │   └── contextfs.ts                  # 工具桥接
+│   └── plugins/
+│       ├── contextfs.plugin.mjs          # 插件入口
+│       └── contextfs/
+│           ├── cli.mjs                   # CLI 入口
+│           ├── src/                      # 核心实现
+│           │   ├── config.mjs            # 配置管理
+│           │   ├── storage.mjs           # 存储层（文件锁、原子写入）
+│           │   ├── compactor.mjs         # 压缩逻辑
+│           │   ├── packer.mjs            # Pack 组装
+│           │   ├── pins.mjs              # Pins 管理
+│           │   ├── summary.mjs           # 摘要生成
+│           │   ├── token.mjs             # Token 估算
+│           │   └── commands.mjs          # 命令实现
+│           ├── test/                     # 测试
+│           └── README.md                 # 详细文档
+└── .contextfs/                           # 运行时数据（自动生成）
+```
+
+## 测试
+
+```bash
+# 单元测试
+npm run test:contextfs:unit
+
+# 回归测试
+npm run test:contextfs:regression
+```
+
+## 技术亮点
+
+- **配置验证**：所有配置项都有范围限制和类型归一化
+- **并发安全**：文件锁机制 + Stale Lock 自动清理
+- **原子写入**：先写临时文件再重命名，保证数据完整性
+- **内容转义**：Pack 分隔符在内容中自动转义，防止格式破坏
+- **精确 Token 估算**：区分 ASCII/CJK 字符，更准确预估
+
+## 设计原则
+
+这是一个**小而精的 MVP**，刻意不做复杂功能：
+
+- 无向量数据库
+- 无复杂 RAG
+- 无全局内存服务
+- 无 UI 面板
+
+专注于解决"长会话上下文爆炸"这一具体问题。
+
+## 许可证
+
+MIT
