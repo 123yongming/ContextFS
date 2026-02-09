@@ -98,6 +98,43 @@ npm run test:contextfs:unit
 npm run test:contextfs:regression
 ```
 
+## Benchmark
+
+用于看三件事：
+- token 增长（ContextFS 是否进入平台期，naive 是否线性上升）
+- 每轮延迟（`turn_time p95`）
+- 压缩触发频率（`compact_count`）
+
+### 运行指令
+
+```bash
+# ContextFS E2E
+npm run bench:e2e -- --turns 3000 --avgChars 400 --variance 0.6 --seed 42
+
+# naive baseline
+npm run bench:naive -- --turns 3000 --avgChars 400 --variance 0.6 --seed 42
+
+# 对比：只跑 AB（contextfs->naive）
+npm run bench -- --turns 3000 --avgChars 400 --variance 0.6 --seed 42 --orders 1
+
+# 对比：跑 AB+BA（输出跨顺序中位结果）
+npm run bench -- --turns 3000 --avgChars 400 --variance 0.6 --seed 42 --orders 2
+```
+
+### 指标含义
+
+- `pack_tokens max/p95`：pack token 规模上界和尾部水平
+- `turn_time p95(ms)`：每轮耗时的 95 分位
+- `compact_count`：压缩触发次数
+- `total_elapsed_ms`：整次 benchmark 总耗时
+
+### 目前效果（turns=3000, avgChars=400, variance=0.6, seed=42）
+
+| Mode | pack_tokens max/p95 (ContextFS vs Naive) | turn_time p95(ms) (ContextFS vs Naive) | compact_count (ContextFS vs Naive) | total_elapsed_ms (ContextFS vs Naive) |
+|---|---|---|---|---|
+| orders=1 | 1895 / 1714 vs 312204 / 296535 | 37.074 vs 43.512 | 46 vs 0 | 67708.688 vs 75457.429 |
+| orders=2 | 1895 / 1714 vs 312204 / 296535 | 38.154 vs 62.213 | 46 vs 0 | 63816.747 vs 90239.452 |
+
 ## 技术亮点
 
 - **配置验证**：所有配置项都有范围限制和类型归一化
@@ -116,7 +153,3 @@ npm run test:contextfs:regression
 - 无 UI 面板
 
 专注于解决"长会话上下文爆炸"这一具体问题。
-
-## 许可证
-
-MIT
