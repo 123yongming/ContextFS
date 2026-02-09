@@ -65,6 +65,7 @@ export class ContextFsStorage {
   }
 
   async acquireLock(maxRetries = 20) {
+    const staleMs = Math.max(1000, Number(this.config.lockStaleMs || 30000));
     for (let i = 0; i <= maxRetries; i += 1) {
       const stamp = `${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2, 8)}`;
       try {
@@ -73,6 +74,15 @@ export class ContextFsStorage {
       } catch (err) {
         if (err?.code !== "EEXIST") {
           throw err;
+        }
+        try {
+          const stat = await fs.stat(this.lockPath);
+          if (Date.now() - stat.mtimeMs > staleMs) {
+            await fs.unlink(this.lockPath);
+            continue;
+          }
+        } catch {
+          // ignore stale lock cleanup failures
         }
         if (i === maxRetries) {
           throw new Error(`contextfs lock timeout: ${this.lockPath}`);
@@ -169,24 +179,8 @@ export class ContextFsStorage {
   async appendHistory(entry) {
     const lock = await this.acquireLock();
     try {
-      const raw = await this.readText("history");
-      const history = !safeTrim(raw)
-        ? []
-        : raw
-            .split("\n")
-            .filter((line) => safeTrim(line))
-            .map((line) => {
-              try {
-                return JSON.parse(line);
-              } catch {
-                return null;
-              }
-            })
-            .filter(Boolean);
-      history.push(entry);
-      const lines = history.map((item) => JSON.stringify(item)).join("\n");
-      await this.writeTextWithLock("history", lines ? `${lines}\n` : "");
-      return history;
+      await fs.appendFile(this.resolve("history"), `${JSON.stringify(entry)}\n`, "utf8");
+      return entry;
     } finally {
       await this.releaseLock(lock);
     }
