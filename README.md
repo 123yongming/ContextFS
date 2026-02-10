@@ -175,10 +175,3 @@ npm run bench -- --turns 3000 --avgChars 400 --variance 0.6 --seed 42 --orders 2
 - 无 UI 面板
 
 专注于解决"长会话上下文爆炸"这一具体问题。
-
-## 合规声明（关于 claude-mem）
-
-- ContextFS 在设计上借鉴了“分层检索/渐进式披露”的思想。
-- **未复制** claude-mem 的代码、提示词、数据库 schema 字段命名或实现细节。
-- 本项目默认仍为本地文件模式（`history.ndjson`），未引入其服务化架构。
-- claude-mem 涉及 AGPL-3.0 且其部分组件带 Noncommercial 约束；如需复用其实现，请自行评估许可证风险与兼容性。
