@@ -11,6 +11,7 @@ import { buildContextPack } from "../src/packer.mjs";
 import { maybeCompact } from "../src/compactor.mjs";
 import { mergeConfig } from "../src/config.mjs";
 import { ContextFsStorage } from "../src/storage.mjs";
+import { runCtxCommand } from "../src/commands.mjs";
 
 test("estimateTokens is stable and monotonic", () => {
   const a = estimateTokens("abcd");
@@ -84,6 +85,9 @@ test("mergeConfig clamps invalid values and normalizes booleans", () => {
   assert.equal(cfg.autoCompact, true);
   assert.equal(cfg.debug, true);
   assert.notEqual(cfg.packDelimiterStart, cfg.packDelimiterEnd);
+  const huge = mergeConfig({ packDelimiterStart: "S".repeat(400), packDelimiterEnd: "E".repeat(400) });
+  assert.ok(huge.packDelimiterStart.length <= 128);
+  assert.ok(huge.packDelimiterEnd.length <= 128);
 });
 
 async function withTempStorage(run) {
@@ -239,5 +243,384 @@ test("maybeCompact does not lose concurrent append", async () => {
 
     const history = await storage.readHistory();
     assert.ok(history.some((item) => item.text === "NEW-APPEND"));
+  });
+});
+
+test("appendHistory writes normalized retrieval schema fields", async () => {
+  await withTempStorage(async ({ storage }) => {
+    await storage.appendHistory({
+      role: "user",
+      text: "open src/app.mjs and check https://example.com/issues/12 #42",
+      ts: "2026-02-09T00:00:00.000Z",
+    });
+
+    const history = await storage.readHistory();
+    assert.equal(history.length, 1);
+    const row = history[0];
+    assert.ok(typeof row.id === "string" && row.id.length >= 6);
+    assert.equal(row.role, "user");
+    assert.ok(typeof row.type === "string" && row.type.length > 0);
+    assert.ok(Array.isArray(row.refs));
+    assert.ok(row.refs.length >= 1);
+    assert.equal(typeof row.text, "string");
+  });
+});
+
+test("legacy history rows are normalized and retrievable via search/timeline/get", async () => {
+  await withTempStorage(async ({ storage, workspaceDir, config }) => {
+    const historyPath = path.join(workspaceDir, ".contextfs", "history.ndjson");
+    const legacyRows = [
+      JSON.stringify({ role: "user", text: "legacy alpha row", ts: "2026-02-09T00:00:01.000Z" }),
+      JSON.stringify({ role: "assistant", text: "legacy beta row", ts: "2026-02-09T00:00:02.000Z" }),
+      JSON.stringify({ text: "legacy gamma row without role", ts: "2026-02-09T00:00:03.000Z" }),
+    ].join("\n");
+    await fs.writeFile(historyPath, `${legacyRows}\n`, "utf8");
+
+    const normalized = await storage.readHistory();
+    assert.equal(normalized.length, 3);
+    assert.ok(normalized.every((item) => typeof item.id === "string" && item.id));
+
+    const anchorId = normalized[1].id;
+    const search = await runCtxCommand('ctx search "legacy" --k 3', storage, config);
+    assert.equal(search.ok, true);
+    assert.ok(search.text.includes(anchorId));
+
+    const timeline = await runCtxCommand(`ctx timeline ${anchorId} --before 1 --after 1`, storage, config);
+    assert.equal(timeline.ok, true);
+    assert.ok(timeline.text.includes(anchorId));
+
+    const detail = await runCtxCommand(`ctx get ${anchorId}`, storage, config);
+    assert.equal(detail.ok, true);
+    assert.ok(detail.text.includes("legacy beta row"));
+  });
+});
+
+test("legacy row without ts is stable across repeated reads and search->get", async () => {
+  await withTempStorage(async ({ storage, workspaceDir, config }) => {
+    const historyPath = path.join(workspaceDir, ".contextfs", "history.ndjson");
+    const rows = [
+      JSON.stringify({ role: "user", text: "no ts row A" }),
+      JSON.stringify({ role: "assistant", text: "no ts row B" }),
+    ].join("\n");
+    await fs.writeFile(historyPath, `${rows}\n`, "utf8");
+
+    const first = await storage.readHistory();
+    const second = await storage.readHistory();
+    assert.equal(first[0].id, second[0].id);
+    assert.equal(first[0].ts, second[0].ts);
+
+    const search = await runCtxCommand('ctx search "no ts row" --k 2', storage, config);
+    assert.equal(search.ok, true);
+    const hitLine = search.text.split("\n").find((line) => /^H-/.test(line));
+    assert.ok(hitLine);
+    const id = hitLine.split("|")[0].trim();
+    const get = await runCtxCommand(`ctx get ${id}`, storage, config);
+    assert.equal(get.ok, true);
+  });
+});
+
+test("legacy row with bad ts is stable across repeated reads and search->get", async () => {
+  await withTempStorage(async ({ storage, workspaceDir, config }) => {
+    const historyPath = path.join(workspaceDir, ".contextfs", "history.ndjson");
+    const rows = [
+      JSON.stringify({ role: "user", text: "bad ts alpha", ts: "not-a-time" }),
+      JSON.stringify({ role: "assistant", text: "bad ts beta", ts: "still-bad" }),
+    ].join("\n");
+    await fs.writeFile(historyPath, `${rows}\n`, "utf8");
+
+    const first = await storage.readHistory();
+    const second = await storage.readHistory();
+    assert.equal(first[1].id, second[1].id);
+    assert.equal(first[1].ts, second[1].ts);
+
+    const search = await runCtxCommand('ctx search "bad ts beta" --k 1', storage, config);
+    assert.equal(search.ok, true);
+    const hitLine = search.text.split("\n").find((line) => /^H-/.test(line));
+    assert.ok(hitLine);
+    const id = hitLine.split("|")[0].trim();
+    const get = await runCtxCommand(`ctx get ${id}`, storage, config);
+    assert.equal(get.ok, true);
+    assert.ok(get.text.includes("bad ts beta"));
+  });
+});
+
+test("duplicate content rows produce unique ids after normalization", async () => {
+  await withTempStorage(async ({ storage, workspaceDir }) => {
+    const historyPath = path.join(workspaceDir, ".contextfs", "history.ndjson");
+    const same = { role: "user", text: "duplicate row", ts: "2026-02-09T10:00:00.000Z" };
+    await fs.writeFile(historyPath, `${JSON.stringify(same)}\n${JSON.stringify(same)}\n`, "utf8");
+
+    const rows = await storage.readHistory();
+    assert.equal(rows.length, 2);
+    assert.notEqual(rows[0].id, rows[1].id);
+    assert.ok(rows[1].id.startsWith(`${rows[0].id}-`) || rows[1].id.includes("-"));
+  });
+});
+
+test("search and timeline outputs are bounded and do not dump full text", async () => {
+  await withTempStorage(async ({ storage, config }) => {
+    const veryLong = `important-query ${"LONG".repeat(300)}`;
+    await storage.appendHistory({ role: "user", text: veryLong, ts: "2026-02-09T00:01:00.000Z" });
+    const row = (await storage.readHistory())[0];
+
+    const search = await runCtxCommand('ctx search "important-query" --k 5', storage, config);
+    assert.equal(search.ok, true);
+    assert.ok(search.text.includes(row.id));
+    assert.equal(search.text.includes("LONG".repeat(120)), false);
+
+    const timeline = await runCtxCommand(`ctx timeline ${row.id} --before 0 --after 0`, storage, config);
+    assert.equal(timeline.ok, true);
+    assert.ok(timeline.text.includes(row.id));
+    assert.equal(timeline.text.includes("LONG".repeat(120)), false);
+  });
+});
+
+test("timeline window returns exact before/after neighborhood", async () => {
+  await withTempStorage(async ({ storage, config }) => {
+    for (let i = 1; i <= 7; i += 1) {
+      await storage.appendHistory({
+        role: i % 2 ? "user" : "assistant",
+        text: `timeline-row-${i}`,
+        ts: `2026-02-09T00:02:0${i}.000Z`,
+      });
+    }
+    const history = await storage.readHistory();
+    const anchor = history[3];
+
+    const timeline = await runCtxCommand(`ctx timeline ${anchor.id} --before 1 --after 2`, storage, config);
+    assert.equal(timeline.ok, true);
+    assert.ok(timeline.text.includes("timeline-row-3"));
+    assert.ok(timeline.text.includes("timeline-row-4"));
+    assert.ok(timeline.text.includes("timeline-row-5"));
+    assert.ok(timeline.text.includes("timeline-row-6"));
+    assert.equal(timeline.text.includes("timeline-row-2"), false);
+    assert.equal(timeline.text.includes("timeline-row-7"), false);
+  });
+});
+
+test("buildContextPack enforces hard token threshold under extreme payloads", async () => {
+  await withTempStorage(async ({ storage }) => {
+    const config = mergeConfig({
+      contextfsDir: ".contextfs",
+      tokenThreshold: 380,
+      recentTurns: 8,
+      pinsMaxItems: 20,
+      summaryMaxChars: 6000,
+      manifestMaxLines: 60,
+    });
+
+    await storage.writeText(
+      "pins",
+      "# Pins (short, one line each)\n\n" +
+        Array.from({ length: 16 }, (_, i) => `- [P-${String(i + 1).padStart(8, "0")}] pin-${"X".repeat(120)}`).join("\n") +
+        "\n",
+    );
+    await storage.writeText("summary", `# Rolling Summary\n\n- ${"S".repeat(7000)}\n`);
+    await storage.writeText(
+      "manifest",
+      Array.from({ length: 80 }, (_, i) => `- manifest-item-${i + 1}-${"M".repeat(50)}`).join("\n") + "\n",
+    );
+    for (let i = 1; i <= 12; i += 1) {
+      await storage.appendHistory({
+        role: i % 2 ? "user" : "assistant",
+        text: `${"T".repeat(300)}-turn-${i}`,
+        ts: `2026-02-09T00:03:${String(i).padStart(2, "0")}.000Z`,
+      });
+    }
+
+    await storage.updateState({
+      lastSearchIndex: Array.from({ length: 10 }, (_, i) => ({
+        id: `H-dummy-${i + 1}`,
+        ts: "2026-02-09T00:03:00.000Z",
+        type: "query",
+        summary: `dummy summary ${"Q".repeat(90)}`,
+      })),
+    });
+
+    const pack = await buildContextPack(storage, config);
+    assert.ok(pack.details.estimatedTokens <= config.tokenThreshold);
+  });
+});
+
+test("ctx stats exposes retrieval and pack observability fields", async () => {
+  await withTempStorage(async ({ storage, config }) => {
+    await storage.appendHistory({ role: "user", text: "stats needle row", ts: "2026-02-09T00:04:00.000Z" });
+    await runCtxCommand('ctx search "needle" --k 3', storage, config);
+    const stats = await runCtxCommand("ctx stats", storage, config);
+    assert.equal(stats.ok, true);
+    assert.ok(stats.text.includes("estimated_tokens"));
+    assert.ok(stats.text.includes("threshold"));
+    assert.ok(stats.text.includes("compact_count"));
+    assert.ok(stats.text.includes("last_search_hits"));
+    assert.ok(stats.text.includes("workset_used"));
+  });
+});
+
+test("ctx get applies default head limit and json head keeps valid json", async () => {
+  await withTempStorage(async ({ storage, config }) => {
+    const long = `head-limit-${"Z".repeat(5000)}`;
+    await storage.appendHistory({ role: "user", text: long, ts: "2026-02-09T00:05:00.000Z" });
+    const id = (await storage.readHistory())[0].id;
+
+    const textGet = await runCtxCommand(`ctx get ${id}`, storage, config);
+    assert.equal(textGet.ok, true);
+    assert.ok(textGet.text.length <= config.getDefaultHead + 8);
+
+    const jsonGet = await runCtxCommand(`ctx get ${id} --json --head 100`, storage, config);
+    assert.equal(jsonGet.ok, true);
+    const parsed = JSON.parse(jsonGet.text);
+    assert.equal(parsed.truncated, true);
+    if (parsed.record && typeof parsed.record.text === "string") {
+      assert.ok(parsed.record.text.endsWith("..."));
+      assert.ok(parsed.record.text.length <= 103);
+      assert.ok(parsed.original_text_len > parsed.record.text.length);
+    } else {
+      assert.ok(parsed.note === "budget_too_small" || parsed.truncated === true);
+    }
+  });
+});
+
+test("concurrent searches keep accurate searchCount via atomic updateState", async () => {
+  await withTempStorage(async ({ storage, config }) => {
+    for (let i = 1; i <= 30; i += 1) {
+      await storage.appendHistory({ role: "user", text: `needle-${i}`, ts: `2026-02-09T00:06:${String(i).padStart(2, "0")}.000Z` });
+    }
+    const runs = Array.from({ length: 20 }, () => runCtxCommand('ctx search "needle" --k 3', storage, config));
+    const results = await Promise.all(runs);
+    assert.ok(results.every((r) => r.ok));
+
+    const state = await storage.readState();
+    assert.equal(state.searchCount, 20);
+  });
+});
+
+test("extreme delimiter with small threshold never exceeds token cap", async () => {
+  await withTempStorage(async ({ storage }) => {
+    const config = mergeConfig({
+      contextfsDir: ".contextfs",
+      tokenThreshold: 320,
+      packDelimiterStart: "S".repeat(600),
+      packDelimiterEnd: "E".repeat(600),
+      summaryMaxChars: 5000,
+      manifestMaxLines: 80,
+      recentTurns: 10,
+    });
+
+    await storage.writeText("summary", `# Rolling Summary\n\n- ${"X".repeat(6000)}\n`);
+    await storage.writeText("manifest", Array.from({ length: 120 }, (_, i) => `- item-${i}-${"Y".repeat(40)}`).join("\n") + "\n");
+    for (let i = 0; i < 20; i += 1) {
+      await storage.appendHistory({ role: "assistant", text: `${"T".repeat(180)}-${i}`, ts: `2026-02-09T00:07:${String(i).padStart(2, "0")}.000Z` });
+    }
+
+    const pack = await buildContextPack(storage, config);
+    assert.ok(pack.details.estimatedTokens <= config.tokenThreshold);
+  });
+});
+
+test("minimal mode sets workset_used to zero when workset is trimmed", async () => {
+  await withTempStorage(async ({ storage }) => {
+    const config = mergeConfig({
+      contextfsDir: ".contextfs",
+      tokenThreshold: 300,
+      recentTurns: 10,
+      summaryMaxChars: 7000,
+      manifestMaxLines: 80,
+    });
+
+    await storage.writeText("summary", `# Rolling Summary\n\n- ${"S".repeat(9000)}\n`);
+    await storage.writeText("manifest", Array.from({ length: 120 }, (_, i) => `- m-${i}-${"M".repeat(40)}`).join("\n") + "\n");
+    for (let i = 1; i <= 25; i += 1) {
+      await storage.appendHistory({ role: i % 2 ? "user" : "assistant", text: `${"W".repeat(220)}-${i}`, ts: `2026-02-09T00:08:${String(i).padStart(2, "0")}.000Z` });
+    }
+
+    const pack = await buildContextPack(storage, config);
+    if (pack.block.includes("(trimmed)")) {
+      assert.equal(pack.details.worksetUsed, 0);
+      assert.equal(pack.details.recentTurns, 0);
+      assert.equal(pack.details.retrievalIndexItems, 0);
+    }
+    assert.ok(pack.details.estimatedTokens <= config.tokenThreshold);
+  });
+});
+
+test("ctx get --json --head tiny budgets (32/64) remain valid and bounded", async () => {
+  await withTempStorage(async ({ storage, workspaceDir, config }) => {
+    const historyPath = path.join(workspaceDir, ".contextfs", "history.ndjson");
+    const hugeId = `H-${"ID".repeat(2500)}`;
+    const hugeRefs = Array.from({ length: 200 }, (_, i) => `ref-${i}-${"R".repeat(500)}`);
+    const hugeTags = Array.from({ length: 200 }, (_, i) => `tag-${i}-${"T".repeat(500)}`);
+    const row = {
+      id: hugeId,
+      ts: "2026-02-09T10:00:00.000Z",
+      role: "user",
+      type: `type-${"X".repeat(2000)}`,
+      refs: hugeRefs,
+      tags: hugeTags,
+      text: `body-${"Z".repeat(4000)}`,
+    };
+    await fs.writeFile(historyPath, `${JSON.stringify(row)}\n`, "utf8");
+
+    for (const head of [32, 64]) {
+      const out = await runCtxCommand(`ctx get ${hugeId} --json --head ${head}`, storage, config);
+      assert.equal(out.ok, true);
+      const parsed = JSON.parse(out.text);
+      const bytes = Buffer.byteLength(out.text, "utf8");
+      assert.ok(bytes <= head);
+      if (parsed && parsed.note === "budget_too_small") {
+        assert.ok(Object.hasOwn(parsed, "id"));
+        assert.ok(Object.hasOwn(parsed, "truncated"));
+        assert.ok(Object.hasOwn(parsed, "effective_head"));
+        assert.ok(Object.hasOwn(parsed, "note"));
+      }
+    }
+  });
+});
+
+test("readHistory migration bad-line quarantine is idempotent across repeated runs", async () => {
+  await withTempStorage(async ({ storage, workspaceDir }) => {
+    const contextDir = path.join(workspaceDir, ".contextfs");
+    const historyPath = path.join(contextDir, "history.ndjson");
+    const badPath = path.join(contextDir, "history.bad.ndjson");
+    const good1 = JSON.stringify({ role: "user", text: "ok-1", ts: "2026-02-09T00:00:01.000Z" });
+    const good2 = JSON.stringify({ role: "assistant", text: "ok-2", ts: "2026-02-09T00:00:02.000Z" });
+    await fs.writeFile(historyPath, `${good1}\nNOT_JSON\n${good2}\n`, "utf8");
+
+    const originalWriteTextWithLock = storage.writeTextWithLock.bind(storage);
+    let injectedFailure = true;
+    storage.writeTextWithLock = async (name, content) => {
+      if (name === "state" && injectedFailure) {
+        injectedFailure = false;
+        const err = new Error("injected state write failure");
+        err.code = "EIO";
+        throw err;
+      }
+      return originalWriteTextWithLock(name, content);
+    };
+
+    const beforeState = await storage.readState();
+    await assert.rejects(storage.readHistory());
+    const rows1 = await storage.readHistory();
+    const state1 = await storage.readState();
+    const rows2 = await storage.readHistory();
+    const state2 = await storage.readState();
+    assert.equal(rows1.length, 2);
+    assert.equal(rows2.length, 2);
+
+    const badRaw = await fs.readFile(badPath, "utf8");
+    const badEntries = badRaw.split("\n").filter(Boolean).map((line) => JSON.parse(line));
+    const matches = badEntries.filter((entry) => entry.line === "NOT_JSON");
+    assert.equal(matches.length, 1);
+    assert.equal(typeof matches[0].hash, "string");
+    assert.ok(matches[0].hash.length > 0);
+    const uniqueHashes = new Set(badEntries.map((entry) => entry.hash));
+    assert.equal(uniqueHashes.size, badEntries.length);
+
+    assert.equal((state1.badLineCount || 0), uniqueHashes.size);
+    assert.equal((state2.badLineCount || 0), (state1.badLineCount || 0));
+    assert.ok((state1.badLineCount || 0) >= (beforeState.badLineCount || 0));
+
+    const rewritten = await fs.readFile(historyPath, "utf8");
+    const rewrittenLines = rewritten.split("\n").filter(Boolean);
+    assert.equal(rewrittenLines.length, 2);
   });
 });

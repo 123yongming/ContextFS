@@ -265,6 +265,58 @@ async function test6() {
   };
 }
 
+async function test7() {
+  const workspace = await resetRuntime(".contextfs_rt_retrieval_workflow");
+  const config = mergeConfig({ contextfsDir: ".contextfs", tokenThreshold: 800 });
+  const storage = new ContextFsStorage(workspace, config);
+  await storage.ensureInitialized();
+
+  const rows = [
+    "investigate lock timeout in plugin",
+    "check src/storage.mjs for lock handling",
+    "captured fix details in summary",
+    "issue #42 includes rollback note",
+    "https://example.com/spec/contextfs-retrieval",
+    "final validation done",
+  ];
+  for (let i = 0; i < rows.length; i += 1) {
+    await storage.appendHistory({
+      role: i % 2 ? "assistant" : "user",
+      text: rows[i],
+      ts: new Date(Date.now() + i * 1000).toISOString(),
+    });
+  }
+
+  const search = await runCtxCommand('ctx search "lock" --k 3', storage, config);
+  const searchLine = search.text
+    .split("\n")
+    .find((line) => /^H-[a-f0-9]+\s\|/.test(line));
+  const anchorId = searchLine ? searchLine.split("|")[0].trim() : "";
+  const timeline = anchorId ? await runCtxCommand(`ctx timeline ${anchorId} --before 1 --after 1`, storage, config) : { ok: false, text: "" };
+  const detail = anchorId ? await runCtxCommand(`ctx get ${anchorId} --head 400`, storage, config) : { ok: false, text: "" };
+  const stats = await runCtxCommand("ctx stats", storage, config);
+
+  return {
+    id: "TEST-7",
+    pass:
+      search.ok &&
+      Boolean(anchorId) &&
+      timeline.ok &&
+      detail.ok &&
+      stats.ok &&
+      stats.text.includes("estimated_tokens") &&
+      stats.text.includes("last_search_hits") &&
+      timeline.text.includes(anchorId),
+    metrics: {
+      searchOk: search.ok,
+      timelineOk: timeline.ok,
+      detailOk: detail.ok,
+      statsOk: stats.ok,
+      anchorId,
+    },
+  };
+}
+
 function printTable(results) {
   console.log("\n# ContextFS Regression Results\n");
   console.log("| Test | Status | Key Metrics |");
@@ -280,7 +332,7 @@ function printTable(results) {
 }
 
 async function main() {
-  const results = [await test1(), await test2(), await test3(), await test4(), await test5(), await test6()];
+  const results = [await test1(), await test2(), await test3(), await test4(), await test5(), await test6(), await test7()];
   printTable(results);
   console.log("\n# JSON Summary\n");
   console.log(JSON.stringify({ allPass: results.every((x) => x.pass), results }, null, 2));

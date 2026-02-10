@@ -15,7 +15,7 @@ export async function maybeCompact(storage, config, force = false) {
   const lock = await storage.acquireLock();
   let result;
   try {
-    const history = await storage.readHistory();
+    const history = await storage.readHistory({ migrate: false });
     const pins = await storage.readText("pins");
     const summary = await storage.readText("summary");
     const total = countHistoryTokens(history) + estimateTokens(pins) + estimateTokens(summary);
@@ -57,6 +57,7 @@ export async function maybeCompact(storage, config, force = false) {
           revision: (currentState.revision || 0) + 1,
           updatedAt: now,
           lastCompactedAt: now,
+          compactCount: (currentState.compactCount || 0) + 1,
           lastPackTokens: countHistoryTokens(recentTurns) + estimateTokens(pins) + estimateTokens(merged),
         };
         await storage.writeTextWithLock("state", JSON.stringify(nextState, null, 2) + "\n");

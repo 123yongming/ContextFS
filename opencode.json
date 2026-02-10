@@ -5,7 +5,7 @@
   ],
   "command": {
     "ctx": {
-      "description": "ContextFS: ls/cat/pin/pack/compact",
+      "description": "ContextFS: progressive retrieval (search->timeline->get) + ls/stats/cat/pin/pack/compact/gc (supports --json/--head/--k/--before/--after)",
       "template": "You are running /ctx.\n\nRules:\n- Do NOT run bash.\n- Use the `contextfs` tool exactly once.\n\nUser arguments: $ARGUMENTS\n\nCall:\ncontextfs({ \"cmd\": \"$ARGUMENTS\" })\n\nReturn the tool result verbatim."
     }
   }

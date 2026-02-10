@@ -52,6 +52,18 @@ cp -r <path-to-contextfs>/.opencode/plugins/contextfs .opencode/plugins/
 # 查看状态
 node .opencode/plugins/contextfs/cli.mjs ls
 
+# 检索索引（轻量、限长）
+node .opencode/plugins/contextfs/cli.mjs search "lock timeout" --k 5
+
+# 按 id 查看上下文窗口
+node .opencode/plugins/contextfs/cli.mjs timeline H-abc12345 --before 3 --after 3
+
+# 按 id 拉取完整记录（可 head 限长）
+node .opencode/plugins/contextfs/cli.mjs get H-abc12345 --head 1200
+
+# 查看可观测指标
+node .opencode/plugins/contextfs/cli.mjs stats
+
 # 添加关键约束
 node .opencode/plugins/contextfs/cli.mjs pin "不要修改核心架构"
 
@@ -61,6 +73,16 @@ node .opencode/plugins/contextfs/cli.mjs compact
 # 查看当前 Pack
 node .opencode/plugins/contextfs/cli.mjs pack
 ```
+
+## 推荐工作流（渐进式检索）
+
+在长会话中建议采用三段式：
+
+1. `ctx search "<query>"`：先拿轻量索引（`id | ts | type | one-line summary`）
+2. `ctx timeline <id>`：看命中条目前后窗口，确认上下文
+3. `ctx get <id>`：仅在需要细节时拉取完整记录
+
+这样可以减少 token 浪费，避免 pack 中塞入无关全文。
 
 ## 项目结构
 
@@ -153,3 +175,10 @@ npm run bench -- --turns 3000 --avgChars 400 --variance 0.6 --seed 42 --orders 2
 - 无 UI 面板
 
 专注于解决"长会话上下文爆炸"这一具体问题。
+
+## 合规声明（关于 claude-mem）
+
+- ContextFS 在设计上借鉴了“分层检索/渐进式披露”的思想。
+- **未复制** claude-mem 的代码、提示词、数据库 schema 字段命名或实现细节。
+- 本项目默认仍为本地文件模式（`history.ndjson`），未引入其服务化架构。
+- claude-mem 涉及 AGPL-3.0 且其部分组件带 Noncommercial 约束；如需复用其实现，请自行评估许可证风险与兼容性。

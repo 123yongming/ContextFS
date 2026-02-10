@@ -10,6 +10,13 @@ export const DEFAULT_CONFIG = {
   manifestMaxLines: 20,
   pinScanMaxChars: 4000,
   lockStaleMs: 30000,
+  searchDefaultK: 5,
+  searchSummaryMaxChars: 120,
+  timelineBeforeDefault: 3,
+  timelineAfterDefault: 3,
+  retrievalIndexMaxItems: 8,
+  packSummaryMinChars: 128,
+  getDefaultHead: 1200,
   debug: false,
   packDelimiterStart: "<<<CONTEXTFS:BEGIN>>>",
   packDelimiterEnd: "<<<CONTEXTFS:END>>>",
@@ -49,8 +56,10 @@ export function mergeConfig(userConfig = {}) {
     ...DEFAULT_CONFIG,
     ...userConfig,
   };
-  const packDelimiterStart = toText(merged.packDelimiterStart, DEFAULT_CONFIG.packDelimiterStart);
-  let packDelimiterEnd = toText(merged.packDelimiterEnd, DEFAULT_CONFIG.packDelimiterEnd);
+  const rawDelimiterStart = toText(merged.packDelimiterStart, DEFAULT_CONFIG.packDelimiterStart);
+  const rawDelimiterEnd = toText(merged.packDelimiterEnd, DEFAULT_CONFIG.packDelimiterEnd);
+  const packDelimiterStart = rawDelimiterStart.slice(0, 128) || DEFAULT_CONFIG.packDelimiterStart;
+  let packDelimiterEnd = rawDelimiterEnd.slice(0, 128) || DEFAULT_CONFIG.packDelimiterEnd;
   if (packDelimiterStart === packDelimiterEnd) {
     packDelimiterEnd = DEFAULT_CONFIG.packDelimiterEnd;
   }
@@ -68,6 +77,13 @@ export function mergeConfig(userConfig = {}) {
     manifestMaxLines: clampInt(merged.manifestMaxLines, DEFAULT_CONFIG.manifestMaxLines, 8, 200),
     pinScanMaxChars: clampInt(merged.pinScanMaxChars, DEFAULT_CONFIG.pinScanMaxChars, 256, 50000),
     lockStaleMs: clampInt(merged.lockStaleMs, DEFAULT_CONFIG.lockStaleMs, 1000, 600000),
+    searchDefaultK: clampInt(merged.searchDefaultK, DEFAULT_CONFIG.searchDefaultK, 1, 50),
+    searchSummaryMaxChars: clampInt(merged.searchSummaryMaxChars, DEFAULT_CONFIG.searchSummaryMaxChars, 40, 400),
+    timelineBeforeDefault: clampInt(merged.timelineBeforeDefault, DEFAULT_CONFIG.timelineBeforeDefault, 0, 20),
+    timelineAfterDefault: clampInt(merged.timelineAfterDefault, DEFAULT_CONFIG.timelineAfterDefault, 0, 20),
+    retrievalIndexMaxItems: clampInt(merged.retrievalIndexMaxItems, DEFAULT_CONFIG.retrievalIndexMaxItems, 0, 50),
+    packSummaryMinChars: clampInt(merged.packSummaryMinChars, DEFAULT_CONFIG.packSummaryMinChars, 32, 2000),
+    getDefaultHead: clampInt(merged.getDefaultHead, DEFAULT_CONFIG.getDefaultHead, 64, 200000),
     debug: toBool(merged.debug, DEFAULT_CONFIG.debug),
     packDelimiterStart,
     packDelimiterEnd,
