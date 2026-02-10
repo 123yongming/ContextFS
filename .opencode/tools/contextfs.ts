@@ -11,9 +11,11 @@ function runNode(args: string[], cwd: string): Promise<string> {
 }
 
 export default tool({
-  description: "ContextFS command runner (ls/cat/pin/pack/compact/gc)",
+  description: "ContextFS progressive retrieval runner (search->timeline->get) with ls/stats/cat/pin/pack/compact/gc",
   args: {
-    cmd: tool.schema.string().describe("e.g. 'ls', 'cat pins --head 30', 'pin ...', 'pack', 'compact'"),
+    cmd: tool.schema.string().describe(
+      "e.g. 'help', 'ls', 'stats --json', 'search \"query\" --k 5 --json', 'timeline <id> --before 3 --after 3 --json', 'get <id> --head 1200 --json', 'cat pins --head 30', 'pin ...', 'pack', 'compact', 'gc'"
+    ),
   },
   async execute({ cmd }, ctx) {
     const cwd = ctx.cwd;

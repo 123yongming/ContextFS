@@ -19,6 +19,182 @@ function toInt(value, fallback) {
   return Number.isFinite(n) ? n : fallback;
 }
 
+function clampInt(value, min, max) {
+  return Math.max(min, Math.min(max, Math.floor(Number(value) || 0)));
+}
+
+function hasFlag(args, flag) {
+  return args.includes(flag);
+}
+
+function getFlagValue(args, flag, fallback) {
+  const idx = args.indexOf(flag);
+  if (idx < 0) {
+    return fallback;
+  }
+  return args[idx + 1] ?? fallback;
+}
+
+function stripFlags(args, flagsWithValue = []) {
+  const valueFlags = new Set(flagsWithValue);
+  const out = [];
+  for (let i = 0; i < args.length; i += 1) {
+    const part = args[i];
+    if (valueFlags.has(part)) {
+      i += 1;
+      continue;
+    }
+    if (part === "--json") {
+      continue;
+    }
+    out.push(part);
+  }
+  return out;
+}
+
+function lineSummary(text, maxChars) {
+  const oneLine = String(text || "").replace(/\s+/g, " ").trim();
+  if (oneLine.length <= maxChars) {
+    return oneLine;
+  }
+  return `${oneLine.slice(0, Math.max(0, maxChars - 3))}...`;
+}
+
+function tokenize(text) {
+  return String(text || "")
+    .toLowerCase()
+    .split(/[^a-z0-9_\-\u4e00-\u9fa5]+/)
+    .map((x) => x.trim())
+    .filter(Boolean);
+}
+
+function scoreEntry(entry, queryTokens, newestTs) {
+  const text = String(entry.text || "").toLowerCase();
+  const refs = Array.isArray(entry.refs) ? entry.refs.map((x) => String(x || "").toLowerCase()) : [];
+  let score = 0;
+  for (const token of queryTokens) {
+    if (!token) {
+      continue;
+    }
+    if (text.includes(token)) {
+      score += 3;
+    }
+    if (refs.some((ref) => ref.includes(token))) {
+      score += 4;
+    }
+  }
+  if (entry.type === "query") {
+    score += 0.5;
+  }
+  if (entry.type === "response") {
+    score += 0.2;
+  }
+  const ts = Date.parse(String(entry.ts || ""));
+  if (Number.isFinite(ts) && Number.isFinite(newestTs) && newestTs >= ts) {
+    const ageHours = (newestTs - ts) / 3600000;
+    score += 2 / (1 + ageHours);
+  }
+  return score;
+}
+
+function isoMaybe(text) {
+  const ts = Date.parse(String(text || ""));
+  if (!Number.isFinite(ts)) {
+    return "n/a";
+  }
+  return new Date(ts).toISOString();
+}
+
+function jsonOrText(payload, asJson) {
+  if (asJson) {
+    return textResult(JSON.stringify(payload, null, 2));
+  }
+  return null;
+}
+
+function truncateValue(value, maxLen, fieldName, truncatedFields) {
+  const text = String(value || "");
+  if (text.length <= maxLen) {
+    return text;
+  }
+  truncatedFields.add(fieldName);
+  return `${text.slice(0, Math.max(0, maxLen - 3))}...`;
+}
+
+function trimStringArray(values, maxItems, itemMaxLen, fieldName, truncatedFields) {
+  const source = Array.isArray(values) ? values.map((item) => String(item || "")) : [];
+  const out = [];
+  if (source.length > maxItems) {
+    truncatedFields.add(fieldName);
+  }
+  for (let i = 0; i < Math.min(maxItems, source.length); i += 1) {
+    const item = source[i];
+    if (item.length > itemMaxLen) {
+      truncatedFields.add(fieldName);
+      out.push(`${item.slice(0, Math.max(0, itemMaxLen - 3))}...`);
+    } else {
+      out.push(item);
+    }
+  }
+  return out;
+}
+
+function applyJsonHeadLimit(payload, head, limits = {}) {
+  const cfg = {
+    idMaxLen: 128,
+    typeMaxLen: 128,
+    arrayMaxItems: 20,
+    arrayItemMaxLen: 256,
+    headText: 1200,
+    ...limits,
+  };
+  const effectiveHead = Number(head) > 0 ? Number(head) : cfg.headText;
+  const textMax = Math.max(4, Math.min(cfg.headText, effectiveHead));
+  const truncatedFields = new Set();
+  const record = payload?.record || {};
+
+  const textValue = String(record.text || "");
+  const textOut = textValue.length > textMax
+    ? `${textValue.slice(0, Math.max(0, textMax - 3))}...`
+    : textValue;
+  if (textOut !== textValue) {
+    truncatedFields.add("text");
+  }
+
+  const trimmedRecord = {
+    ...record,
+    id: truncateValue(record.id, cfg.idMaxLen, "id", truncatedFields),
+    type: truncateValue(record.type, cfg.typeMaxLen, "type", truncatedFields),
+    refs: trimStringArray(record.refs, cfg.arrayMaxItems, cfg.arrayItemMaxLen, "refs", truncatedFields),
+    tags: trimStringArray(record.tags, cfg.arrayMaxItems, cfg.arrayItemMaxLen, "tags", truncatedFields),
+    text: textOut,
+  };
+
+  const outputPayload = {
+    ...payload,
+    record: trimmedRecord,
+    truncated_fields: Array.from(truncatedFields),
+    truncated: truncatedFields.size > 0,
+    original_sizes: {
+      id: String(record.id || "").length,
+      type: String(record.type || "").length,
+      refs: Array.isArray(record.refs) ? record.refs.length : 0,
+      tags: Array.isArray(record.tags) ? record.tags.length : 0,
+      text: textValue.length,
+    },
+  };
+  return {
+    payload: outputPayload,
+    truncated_fields: outputPayload.truncated_fields,
+    truncated: outputPayload.truncated,
+    original_sizes: outputPayload.original_sizes,
+  };
+}
+
+function findIdMatches(history, id) {
+  return history.filter((item) => String(item.id) === String(id));
+}
+
 function safeFileName(name) {
   const map = fileMap();
   const target = String(name || "").toLowerCase();
@@ -70,6 +246,10 @@ export async function runCtxCommand(commandLine, storage, config) {
         "  ctx cat <file> [--head 30]",
         "  ctx pin \"<text>\"",
         "  ctx compact",
+        "  ctx search \"<query>\" [--k 5]",
+        "  ctx timeline <id> [--before 3 --after 3]",
+        "  ctx get <id> [--head 1200]",
+        "  ctx stats",
         "  ctx gc",
       ].join("\n"),
     );
@@ -81,6 +261,7 @@ export async function runCtxCommand(commandLine, storage, config) {
     const summary = await storage.readText("summary");
     const pack = await buildContextPack(storage, config);
     const pinsCount = parsePinsMarkdown(pins).length;
+    const state = await storage.readState();
     const lines = [
       "# ctx ls",
       "",
@@ -91,9 +272,49 @@ export async function runCtxCommand(commandLine, storage, config) {
       `- pins.count: ${pinsCount}`,
       `- summary.chars: ${summary.length}`,
       `- pack.tokens(est): ${pack.details.estimatedTokens}`,
+      `- threshold: ${config.tokenThreshold}`,
+      `- compact_count: ${state.compactCount || 0}`,
+      `- last_search_hits: ${state.lastSearchHits || 0}`,
       `- workset.turns: ${pack.details.recentTurns}`,
+      `- workset_used: ${pack.details.worksetUsed ?? pack.details.recentTurns}`,
     ];
     return textResult(lines.join("\n"));
+  }
+
+  if (cmd === "stats") {
+    const state = await storage.updateState((cur) => ({
+      statsCount: (cur.statsCount || 0) + 1,
+    }));
+    const pack = await buildContextPack(storage, config);
+    const payload = {
+      estimated_tokens: pack.details.estimatedTokens,
+      threshold: config.tokenThreshold,
+      compact_count: state.compactCount || 0,
+      last_search_hits: state.lastSearchHits || 0,
+      workset_used: pack.details.worksetUsed ?? pack.details.recentTurns,
+      search_count: state.searchCount || 0,
+      timeline_count: state.timelineCount || 0,
+      get_count: state.getCount || 0,
+      stats_count: state.statsCount || 0,
+    };
+    const jsonOut = jsonOrText(payload, hasFlag(args, "--json"));
+    if (jsonOut) {
+      return jsonOut;
+    }
+    return textResult(
+      [
+        "# ctx stats",
+        `estimated_tokens: ${payload.estimated_tokens}`,
+        `threshold: ${payload.threshold}`,
+        `compact_count: ${payload.compact_count}`,
+        `last_search_hits: ${payload.last_search_hits}`,
+        `workset_used: ${payload.workset_used}`,
+        `search_count: ${payload.search_count}`,
+        `timeline_count: ${payload.timeline_count}`,
+        `get_count: ${payload.get_count}`,
+        `stats_count: ${payload.stats_count}`,
+      ].join("\n"),
+    );
   }
 
   if (cmd === "cat") {
@@ -131,6 +352,216 @@ export async function runCtxCommand(commandLine, storage, config) {
         `- compacted.turns: ${result.compactedTurns}`,
       ].join("\n"),
     );
+  }
+
+  if (cmd === "search") {
+    const asJson = hasFlag(args, "--json");
+    const cleanArgs = stripFlags(args, ["--k"]);
+    const k = clampInt(toInt(getFlagValue(args, "--k", config.searchDefaultK), config.searchDefaultK), 1, 50);
+    const query = cleanArgs.join(" ").trim();
+    if (!query) {
+      return errorResult('usage: ctx search "<query>" [--k 5]');
+    }
+    const queryTokens = tokenize(query);
+    const history = await storage.readHistory();
+    const newestTs = history.length ? Date.parse(String(history[history.length - 1].ts || "")) : Date.now();
+    const ranked = history
+      .map((entry) => ({
+        entry,
+        score: scoreEntry(entry, queryTokens, newestTs),
+      }))
+      .filter((item) => item.score > 0)
+      .sort((a, b) => (b.score - a.score) || String(b.entry.ts || "").localeCompare(String(a.entry.ts || "")))
+      .slice(0, k);
+
+    const rows = ranked.map(({ entry, score }) => ({
+      id: entry.id,
+      ts: isoMaybe(entry.ts),
+      type: entry.type || "note",
+      summary: lineSummary(entry.text, config.searchSummaryMaxChars),
+      score: Number(score.toFixed(3)),
+    }));
+
+    await storage.updateState((cur) => ({
+      lastSearchHits: rows.length,
+      lastSearchQuery: query,
+      lastSearchAt: new Date().toISOString(),
+      lastSearchIndex: rows,
+      searchCount: (cur.searchCount || 0) + 1,
+    }));
+
+    if (asJson) {
+      return textResult(JSON.stringify({ query, k, hits: rows.length, results: rows }, null, 2));
+    }
+
+    const lines = [
+      `# search (${rows.length} hits)`,
+      "",
+      ...rows.map((x) => `${x.id} | ${x.ts} | ${x.type} | ${x.summary}`),
+    ];
+    return textResult(lines.join("\n"));
+  }
+
+  if (cmd === "timeline") {
+    const asJson = hasFlag(args, "--json");
+    const cleanArgs = stripFlags(args, ["--before", "--after"]);
+    const anchorId = cleanArgs[0];
+    if (!anchorId) {
+      return errorResult("usage: ctx timeline <id> [--before 3 --after 3]");
+    }
+    const before = clampInt(
+      toInt(getFlagValue(args, "--before", config.timelineBeforeDefault), config.timelineBeforeDefault),
+      0,
+      20,
+    );
+    const after = clampInt(
+      toInt(getFlagValue(args, "--after", config.timelineAfterDefault), config.timelineAfterDefault),
+      0,
+      20,
+    );
+    const history = await storage.readHistory();
+    const matches = findIdMatches(history, anchorId);
+    if (!matches.length) {
+      return errorResult(`id not found: ${anchorId}`);
+    }
+    if (matches.length > 1) {
+      return errorResult(`id conflict: ${anchorId}. run ctx gc or migration to repair duplicate ids`);
+    }
+    const index = history.findIndex((item) => String(item.id) === String(anchorId));
+    const start = Math.max(0, index - before);
+    const end = Math.min(history.length, index + after + 1);
+    const slice = history.slice(start, end).map((entry) => ({
+      id: entry.id,
+      ts: isoMaybe(entry.ts),
+      type: entry.type || "note",
+      summary: lineSummary(entry.text, config.searchSummaryMaxChars),
+    }));
+
+    await storage.updateState((cur) => ({
+      timelineCount: (cur.timelineCount || 0) + 1,
+      lastTimelineAnchor: anchorId,
+    }));
+
+    if (asJson) {
+      return textResult(JSON.stringify({ anchor: anchorId, before, after, results: slice }, null, 2));
+    }
+    const lines = [
+      `# timeline ${anchorId}`,
+      "",
+      ...slice.map((x) => `${x.id} | ${x.ts} | ${x.type} | ${x.summary}`),
+    ];
+    return textResult(lines.join("\n"));
+  }
+
+  if (cmd === "get") {
+    const asJson = hasFlag(args, "--json");
+    const cleanArgs = stripFlags(args, ["--head"]);
+    const id = cleanArgs[0];
+    if (!id) {
+      return errorResult("usage: ctx get <id> [--head 1200]");
+    }
+    const head = clampInt(toInt(getFlagValue(args, "--head", config.getDefaultHead), config.getDefaultHead), 0, 200000);
+    const history = await storage.readHistory();
+    const matches = findIdMatches(history, id);
+    if (!matches.length) {
+      return errorResult(`id not found: ${id}`);
+    }
+    if (matches.length > 1) {
+      return errorResult(`id conflict: ${id}. run ctx gc or migration to repair duplicate ids`);
+    }
+    const row = matches[0];
+    await storage.updateState((cur) => ({
+      getCount: (cur.getCount || 0) + 1,
+    }));
+    if (asJson) {
+      const jsonBudget = head > 0 ? head : config.getDefaultHead;
+      const base = {
+        record: row,
+        head: jsonBudget,
+        original_text_len: String(row.text || "").length,
+      };
+      let limited = applyJsonHeadLimit(base, jsonBudget, {
+        headText: config.getDefaultHead,
+      }).payload;
+      let json = JSON.stringify(limited, null, 2);
+      let bytes = Buffer.byteLength(json, "utf8");
+      let guard = 0;
+      const truncatedFields = new Set(limited.truncated_fields || []);
+      while (bytes > jsonBudget && guard < 500) {
+        guard += 1;
+        const refs = Array.isArray(limited.record.refs) ? limited.record.refs : [];
+        const tags = Array.isArray(limited.record.tags) ? limited.record.tags : [];
+        const textValue = String(limited.record.text || "");
+        if (refs.length > 0) {
+          limited.record.refs = refs.slice(0, refs.length - 1);
+          truncatedFields.add("refs");
+        } else if (tags.length > 0) {
+          limited.record.tags = tags.slice(0, tags.length - 1);
+          truncatedFields.add("tags");
+        } else if (textValue.length > 4) {
+          const next = Math.max(4, textValue.length - 32);
+          limited.record.text = `${textValue.slice(0, Math.max(0, next - 3))}...`;
+          truncatedFields.add("text");
+        } else if (String(limited.record.id || "").length > 16) {
+          limited.record.id = truncateValue(limited.record.id, 16, "id", truncatedFields);
+        } else if (String(limited.record.type || "").length > 16) {
+          limited.record.type = truncateValue(limited.record.type, 16, "type", truncatedFields);
+        } else {
+          break;
+        }
+        limited.truncated = true;
+        limited.truncated_fields = Array.from(truncatedFields);
+        json = JSON.stringify(limited, null, 2);
+        bytes = Buffer.byteLength(json, "utf8");
+      }
+
+      if (bytes > jsonBudget) {
+        limited = {
+          record: {
+            id: truncateValue(limited.record.id, 16, "id", truncatedFields),
+            type: truncateValue(limited.record.type, 16, "type", truncatedFields),
+            refs: [],
+            tags: [],
+            text: "...",
+          },
+          head: jsonBudget,
+          original_text_len: base.original_text_len,
+          truncated: true,
+          truncated_fields: Array.from(new Set([...truncatedFields, "refs", "tags", "text"])),
+          original_sizes: limited.original_sizes,
+        };
+        json = JSON.stringify(limited, null, 2);
+      }
+      if (Buffer.byteLength(json, "utf8") > jsonBudget) {
+        const originalId = String(row.id || "");
+        const tiny = {
+          id: originalId,
+          truncated: true,
+          effective_head: jsonBudget,
+          note: "budget_too_small",
+        };
+        let tinyJson = JSON.stringify(tiny);
+        while (Buffer.byteLength(tinyJson, "utf8") > jsonBudget && tiny.id.length > 0) {
+          tiny.id = tiny.id.slice(0, Math.max(0, tiny.id.length - 1));
+          tinyJson = JSON.stringify(tiny);
+        }
+        while (Buffer.byteLength(tinyJson, "utf8") > jsonBudget && tiny.note.length > 0) {
+          tiny.note = tiny.note.slice(0, Math.max(0, tiny.note.length - 1));
+          tinyJson = JSON.stringify(tiny);
+        }
+        if (Buffer.byteLength(tinyJson, "utf8") > jsonBudget) {
+          tinyJson = JSON.stringify({ truncated: true });
+        }
+        if (Buffer.byteLength(tinyJson, "utf8") > jsonBudget) {
+          tinyJson = "{}";
+        }
+        return textResult(tinyJson);
+      }
+      return textResult(json);
+    }
+    const full = JSON.stringify(row, null, 2);
+    const clipped = head > 0 ? `${full.slice(0, head)}${full.length > head ? "\n..." : ""}` : full;
+    return textResult(clipped);
   }
 
   if (cmd === "gc") {
