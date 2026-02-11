@@ -8,6 +8,8 @@ const FILES = {
   decisions: "decisions.md",
   tasks: path.join("tasks", "current.md"),
   history: "history.ndjson",
+  historyArchive: "history.archive.ndjson",
+  historyArchiveIndex: "history.archive.index.ndjson",
   historyBad: "history.bad.ndjson",
   state: "state.json",
 };
@@ -192,6 +194,79 @@ function serializeHistoryEntries(entries) {
   return `${entries.map((item) => JSON.stringify(item)).join("\n")}\n`;
 }
 
+function summarizeText(text, maxChars = 240) {
+  const oneLine = String(text || "").replace(/\s+/g, " ").trim();
+  if (oneLine.length <= maxChars) {
+    return oneLine;
+  }
+  return `${oneLine.slice(0, Math.max(0, maxChars - 3))}...`;
+}
+
+function toArchiveIndexEntry(entry, archivedAt) {
+  return {
+    id: String(entry.id || ""),
+    ts: normalizeTs(entry.ts, stableFallbackTs(0)),
+    type: safeTrim(entry.type) || "note",
+    refs: uniqList(Array.isArray(entry.refs) ? entry.refs : [], 12),
+    summary: summarizeText(entry.text, 240),
+    archivedAt: normalizeTs(archivedAt, nowIso()),
+    source: "archive",
+  };
+}
+
+function parseArchiveIndexText(rawText) {
+  const lines = String(rawText || "").split("\n");
+  const byId = new Map();
+  for (let idx = 0; idx < lines.length; idx += 1) {
+    const line = lines[idx];
+    const trimmed = safeTrim(line);
+    if (!trimmed) {
+      continue;
+    }
+    try {
+      const parsed = JSON.parse(line);
+      const id = safeTrim(parsed.id);
+      if (!id) {
+        continue;
+      }
+      byId.set(id, {
+        id,
+        ts: normalizeTs(parsed.ts, stableFallbackTs(idx)),
+        type: safeTrim(parsed.type) || "note",
+        refs: uniqList(Array.isArray(parsed.refs) ? parsed.refs : [], 12),
+        summary: summarizeText(parsed.summary ?? parsed.text ?? "", 240),
+        archivedAt: normalizeTs(parsed.archivedAt, stableFallbackTs(idx)),
+        source: "archive",
+      });
+    } catch {
+      // ignore bad archive index lines
+    }
+  }
+  return Array.from(byId.values()).sort((a, b) => String(a.ts || "").localeCompare(String(b.ts || "")));
+}
+
+function parseArchiveTextPreserveIds(rawText) {
+  const lines = String(rawText || "").split("\n");
+  const entries = [];
+  const badLines = [];
+  for (let idx = 0; idx < lines.length; idx += 1) {
+    const line = safeTrim(lines[idx]);
+    if (!line) {
+      continue;
+    }
+    try {
+      const normalized = normalizeEntry(JSON.parse(line), stableFallbackTs(idx));
+      entries.push(normalized);
+    } catch {
+      badLines.push(line);
+    }
+  }
+  return {
+    entries,
+    badLines,
+  };
+}
+
 function parseHistoryText(rawText) {
   const lines = String(rawText || "").split("\n");
 
@@ -295,6 +370,8 @@ export class ContextFsStorage {
     await this.ensureFile("decisions", this.defaultDecisions());
     await this.ensureFile("tasks", this.defaultTask());
     await this.ensureFile("history", "");
+    await this.ensureFile("historyArchive", "");
+    await this.ensureFile("historyArchiveIndex", "");
     await this.ensureFile("state", JSON.stringify(this.defaultState(), null, 2) + "\n");
 
     await this.refreshManifest();
@@ -573,6 +650,72 @@ export class ContextFsStorage {
     return this.migrateHistoryIfNeeded();
   }
 
+  async readHistoryArchive(options = {}) {
+    const raw = await this.readText("historyArchive");
+    if (!safeTrim(raw)) {
+      return [];
+    }
+    const parsed = parseArchiveTextPreserveIds(raw);
+    return parsed.entries;
+  }
+
+  async readHistoryArchiveIndex() {
+    const raw = await this.readText("historyArchiveIndex");
+    if (!safeTrim(raw)) {
+      return [];
+    }
+    return parseArchiveIndexText(raw);
+  }
+
+  async rebuildHistoryArchiveIndex(options = {}) {
+    const lock = options.locked ? null : await this.acquireLock();
+    try {
+      const rawArchive = await this.readText("historyArchive");
+      const parsed = parseArchiveTextPreserveIds(rawArchive);
+      const entries = parsed.entries;
+      const archivedAt = options.archivedAt || nowIso();
+      const indexEntries = entries.map((entry) => toArchiveIndexEntry(entry, archivedAt));
+      const payload = serializeHistoryEntries(indexEntries);
+      await this.writeTextWithLock("historyArchiveIndex", payload);
+      return {
+        rebuilt: true,
+        archiveEntries: entries.length,
+        indexEntries: indexEntries.length,
+      };
+    } finally {
+      if (lock) {
+        await this.releaseLock(lock);
+      }
+    }
+  }
+
+  async findHistoryArchiveById(id) {
+    const target = safeTrim(id);
+    if (!target) {
+      return null;
+    }
+    const raw = await this.readText("historyArchive");
+    if (!safeTrim(raw)) {
+      return null;
+    }
+    const lines = raw.split("\n");
+    for (let i = lines.length - 1; i >= 0; i -= 1) {
+      const line = safeTrim(lines[i]);
+      if (!line) {
+        continue;
+      }
+      try {
+        const normalized = normalizeEntry(JSON.parse(line), stableFallbackTs(i));
+        if (String(normalized.id) === target) {
+          return normalized;
+        }
+      } catch {
+        // ignore bad line in archive
+      }
+    }
+    return null;
+  }
+
   async writeHistory(items) {
     const normalized = normalizeHistoryItems(items);
     await this.writeText("history", serializeHistoryEntries(normalized));
@@ -593,6 +736,33 @@ export class ContextFsStorage {
     }
   }
 
+  async appendHistoryArchive(entries, options = {}) {
+    const list = Array.isArray(entries) ? entries : [];
+    if (!list.length) {
+      return [];
+    }
+    const normalized = normalizeHistoryItems(list);
+    const archivedAt = options.archivedAt || nowIso();
+    const payload = `${normalized.map((item) => JSON.stringify(item)).join("\n")}\n`;
+    const indexPayload = `${normalized
+      .map((item) => JSON.stringify(toArchiveIndexEntry(item, archivedAt)))
+      .join("\n")}\n`;
+    const write = async () => {
+      await fs.appendFile(this.resolve("historyArchive"), payload, "utf8");
+      await fs.appendFile(this.resolve("historyArchiveIndex"), indexPayload, "utf8");
+      return normalized;
+    };
+    if (options.locked) {
+      return write();
+    }
+    const lock = await this.acquireLock();
+    try {
+      return await write();
+    } finally {
+      await this.releaseLock(lock);
+    }
+  }
+
   async refreshManifest() {
     const now = nowIso();
     const state = await this.readState();
@@ -608,6 +778,8 @@ export class ContextFsStorage {
       "- decisions.md | long-form decisions and rationale | tags: decision,log",
       "- tasks/current.md | current task status | tags: task,short",
       "- history.ndjson | compactable turn history | tags: runtime,history",
+      "- history.archive.ndjson | archived compacted turn history | tags: runtime,archive",
+      "- history.archive.index.ndjson | archive retrieval index | tags: runtime,index",
       "",
       "## mode",
       `- autoInject: ${String(this.config.autoInject)}`,

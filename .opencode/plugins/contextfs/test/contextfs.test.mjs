@@ -246,6 +246,170 @@ test("maybeCompact does not lose concurrent append", async () => {
   });
 });
 
+test("compacted turns remain retrievable via archive fallback", async () => {
+  await withTempStorage(async ({ storage, config }) => {
+    const localConfig = {
+      ...config,
+      recentTurns: 2,
+      tokenThreshold: 1,
+      autoCompact: true,
+    };
+    for (let i = 1; i <= 6; i += 1) {
+      await storage.appendHistory({
+        role: i % 2 ? "user" : "assistant",
+        text: `archive-target-${i}`,
+        ts: `2026-02-10T00:00:0${i}.000Z`,
+      });
+    }
+
+    const before = await storage.readHistory();
+    const archivedId = before[1].id;
+    const result = await maybeCompact(storage, localConfig, true);
+    assert.equal(result.compacted, true);
+
+    const hot = await storage.readHistory();
+    const archive = await storage.readHistoryArchive();
+    const archiveIndex = await storage.readHistoryArchiveIndex();
+    assert.equal(hot.some((item) => item.id === archivedId), false);
+    assert.equal(archive.some((item) => item.id === archivedId), true);
+    assert.equal(archiveIndex.some((item) => item.id === archivedId), true);
+
+    const getOut = await runCtxCommand(`ctx get ${archivedId}`, storage, localConfig);
+    assert.equal(getOut.ok, true);
+    assert.ok(getOut.text.includes("\"source\": \"archive\""));
+    assert.ok(getOut.text.includes("archive-target-2"));
+
+    const timelineOut = await runCtxCommand(`ctx timeline ${archivedId} --before 1 --after 1`, storage, localConfig);
+    assert.equal(timelineOut.ok, true);
+    assert.ok(timelineOut.text.includes("archive |"));
+
+    const searchOut = await runCtxCommand('ctx search "archive-target-2" --k 3 --scope all', storage, localConfig);
+    assert.equal(searchOut.ok, true);
+    assert.ok(searchOut.text.includes(archivedId));
+    assert.ok(searchOut.text.includes("archive |"));
+
+    const searchArchive = await runCtxCommand('ctx search "archive-target-2" --k 3 --scope archive', storage, localConfig);
+    assert.equal(searchArchive.ok, true);
+    assert.ok(searchArchive.text.includes(archivedId));
+  });
+});
+
+test("ctx reindex rebuilds archive index and preserves archive search/timeline", async () => {
+  await withTempStorage(async ({ storage, workspaceDir, config }) => {
+    const localConfig = {
+      ...config,
+      recentTurns: 2,
+      tokenThreshold: 1,
+      autoCompact: true,
+    };
+    for (let i = 1; i <= 5; i += 1) {
+      await storage.appendHistory({
+        role: i % 2 ? "user" : "assistant",
+        text: `reindex-target-${i}`,
+        ts: `2026-02-10T01:00:0${i}.000Z`,
+      });
+    }
+    await maybeCompact(storage, localConfig, true);
+
+    const archive = await storage.readHistoryArchive();
+    const targetId = archive[0].id;
+    const indexPath = path.join(workspaceDir, ".contextfs", "history.archive.index.ndjson");
+    await fs.writeFile(indexPath, "{\"id\":\"BROKEN\",\"summary\":\"bad\"}\n", "utf8");
+
+    const reindexOut = await runCtxCommand("ctx reindex", storage, localConfig);
+    assert.equal(reindexOut.ok, true);
+    assert.ok(reindexOut.text.includes("reindex done"));
+
+    const index = await storage.readHistoryArchiveIndex();
+    assert.equal(index.some((item) => item.id === targetId), true);
+
+    const searchOut = await runCtxCommand('ctx search "reindex-target-1" --k 3 --scope archive', storage, localConfig);
+    assert.equal(searchOut.ok, true);
+    assert.ok(searchOut.text.includes(targetId));
+
+    const timelineOut = await runCtxCommand(`ctx timeline ${targetId} --before 0 --after 0`, storage, localConfig);
+    assert.equal(timelineOut.ok, true);
+    assert.ok(timelineOut.text.includes("archive |"));
+  });
+});
+
+test("ctx reindex preserves raw duplicate archive ids for get/search consistency", async () => {
+  await withTempStorage(async ({ storage, workspaceDir, config }) => {
+    const archivePath = path.join(workspaceDir, ".contextfs", "history.archive.ndjson");
+    const rowA = {
+      id: "H-dup",
+      ts: "2026-02-11T00:00:00.000Z",
+      role: "user",
+      type: "query",
+      refs: [],
+      text: "alpha duplicate",
+    };
+    const rowB = {
+      id: "H-dup",
+      ts: "2026-02-11T00:10:00.000Z",
+      role: "assistant",
+      type: "response",
+      refs: [],
+      text: "beta duplicate",
+    };
+    await fs.writeFile(archivePath, `${JSON.stringify(rowA)}\n${JSON.stringify(rowB)}\n`, "utf8");
+
+    const reindexOut = await runCtxCommand("ctx reindex", storage, config);
+    assert.equal(reindexOut.ok, true);
+
+    const indexRaw = await storage.readText("historyArchiveIndex");
+    assert.equal(indexRaw.includes("H-dup-1"), false);
+
+    const search = await runCtxCommand('ctx search "duplicate" --scope archive --k 10 --json', storage, config);
+    assert.equal(search.ok, true);
+    const parsed = JSON.parse(search.text);
+    assert.ok(parsed.results.every((item) => item.id === "H-dup"));
+
+    const timeline = await runCtxCommand("ctx timeline H-dup --before 0 --after 0 --json", storage, config);
+    assert.equal(timeline.ok, true);
+    const timelineParsed = JSON.parse(timeline.text);
+    assert.ok(Array.isArray(timelineParsed.results));
+    assert.ok(timelineParsed.results.length >= 1);
+    assert.ok(timelineParsed.results.every((item) => item.id === "H-dup"));
+
+    const getRaw = await runCtxCommand("ctx get H-dup --json", storage, config);
+    assert.equal(getRaw.ok, true);
+    const getParsed = JSON.parse(getRaw.text);
+    assert.equal(getParsed.record.id, "H-dup");
+    assert.equal(getParsed.record.text, "beta duplicate");
+  });
+});
+
+test("archive search finds semantically close cjk phrasing among many unrelated rows", async () => {
+  await withTempStorage(async ({ storage, config }) => {
+    const localConfig = {
+      ...config,
+      recentTurns: 1,
+      tokenThreshold: 1,
+      autoCompact: true,
+    };
+    await storage.appendHistory({
+      role: "user",
+      text: "王俊凯喜欢易烊千玺",
+      ts: "2026-02-11T03:00:00.000Z",
+    });
+    for (let i = 1; i <= 30; i += 1) {
+      await storage.appendHistory({
+        role: i % 2 ? "assistant" : "user",
+        text: `其它无关记录-${i}`,
+        ts: `2026-02-11T03:01:${String(i).padStart(2, "0")}.000Z`,
+      });
+    }
+    await maybeCompact(storage, localConfig, true);
+
+    const out = await runCtxCommand('ctx search "王俊凯喜欢谁" --scope archive --k 5 --json', storage, localConfig);
+    assert.equal(out.ok, true);
+    const parsed = JSON.parse(out.text);
+    assert.ok(parsed.hits >= 1);
+    assert.ok(parsed.results.some((row) => String(row.summary || "").includes("王俊凯喜欢易烊千玺")));
+  });
+});
+
 test("appendHistory writes normalized retrieval schema fields", async () => {
   await withTempStorage(async ({ storage }) => {
     await storage.appendHistory({

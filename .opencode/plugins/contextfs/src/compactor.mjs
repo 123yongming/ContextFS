@@ -48,6 +48,7 @@ export async function maybeCompact(storage, config, force = false) {
         const now = new Date().toISOString();
         const historyText = recentTurns.map((item) => JSON.stringify(item)).join("\n");
 
+        await storage.appendHistoryArchive(oldTurns, { locked: true, archivedAt: now });
         await storage.writeTextWithLock("summary", merged);
         await storage.writeTextWithLock("history", historyText ? `${historyText}\n` : "");
 

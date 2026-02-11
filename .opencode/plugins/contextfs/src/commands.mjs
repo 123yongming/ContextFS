@@ -61,11 +61,34 @@ function lineSummary(text, maxChars) {
 }
 
 function tokenize(text) {
-  return String(text || "")
-    .toLowerCase()
-    .split(/[^a-z0-9_\-\u4e00-\u9fa5]+/)
-    .map((x) => x.trim())
-    .filter(Boolean);
+  const input = String(text || "").toLowerCase();
+  const tokens = new Set(
+    input
+      .split(/[^a-z0-9_\-]+/)
+      .map((x) => x.trim())
+      .filter(Boolean),
+  );
+  const cjkSegments = input.match(/[\u3400-\u9fff]+/g) || [];
+  for (const segment of cjkSegments) {
+    const chars = Array.from(segment);
+    if (!chars.length) {
+      continue;
+    }
+    tokens.add(segment);
+    if (chars.length === 1) {
+      tokens.add(chars[0]);
+      continue;
+    }
+    for (let i = 0; i < chars.length - 1; i += 1) {
+      tokens.add(chars.slice(i, i + 2).join(""));
+    }
+    if (chars.length >= 3) {
+      for (let i = 0; i < chars.length - 2; i += 1) {
+        tokens.add(chars.slice(i, i + 3).join(""));
+      }
+    }
+  }
+  return Array.from(tokens);
 }
 
 function scoreEntry(entry, queryTokens, newestTs) {
@@ -83,6 +106,9 @@ function scoreEntry(entry, queryTokens, newestTs) {
       score += 4;
     }
   }
+  if (score <= 0) {
+    return 0;
+  }
   if (entry.type === "query") {
     score += 0.5;
   }
@@ -92,7 +118,7 @@ function scoreEntry(entry, queryTokens, newestTs) {
   const ts = Date.parse(String(entry.ts || ""));
   if (Number.isFinite(ts) && Number.isFinite(newestTs) && newestTs >= ts) {
     const ageHours = (newestTs - ts) / 3600000;
-    score += 2 / (1 + ageHours);
+    score += 0.2 / (1 + ageHours);
   }
   return score;
 }
@@ -195,6 +221,42 @@ function findIdMatches(history, id) {
   return history.filter((item) => String(item.id) === String(id));
 }
 
+function mergeUniqueHistory(history, archive) {
+  const byId = new Map();
+  for (const item of archive) {
+    byId.set(String(item.id), item);
+  }
+  for (const item of history) {
+    byId.set(String(item.id), item);
+  }
+  return Array.from(byId.values()).sort((a, b) => String(a.ts || "").localeCompare(String(b.ts || "")));
+}
+
+function asArchiveSearchRows(items) {
+  const list = Array.isArray(items) ? items : [];
+  return list.map((item) => ({
+    id: item.id,
+    ts: item.ts,
+    type: item.type || "note",
+    refs: Array.isArray(item.refs) ? item.refs : [],
+    text: String(item.summary || item.text || ""),
+    source: "archive",
+  }));
+}
+
+async function readHistoryByScope(storage, scope = "all") {
+  const normalized = String(scope || "all").toLowerCase();
+  if (normalized === "hot") {
+    return { history: await storage.readHistory(), archive: [] };
+  }
+  if (normalized === "archive") {
+    return { history: [], archive: asArchiveSearchRows(await storage.readHistoryArchiveIndex()) };
+  }
+  const history = await storage.readHistory();
+  const archive = asArchiveSearchRows(await storage.readHistoryArchiveIndex());
+  return { history, archive };
+}
+
 function safeFileName(name) {
   const map = fileMap();
   const target = String(name || "").toLowerCase();
@@ -211,6 +273,8 @@ function safeFileName(name) {
     "current",
     "history",
     "history.ndjson",
+    "history.archive.ndjson",
+    "history.archive.index.ndjson",
   ]);
   if (!allowed.has(target)) {
     return null;
@@ -246,11 +310,12 @@ export async function runCtxCommand(commandLine, storage, config) {
         "  ctx cat <file> [--head 30]",
         "  ctx pin \"<text>\"",
         "  ctx compact",
-        "  ctx search \"<query>\" [--k 5]",
+        "  ctx search \"<query>\" [--k 5] [--scope all|hot|archive]",
         "  ctx timeline <id> [--before 3 --after 3]",
         "  ctx get <id> [--head 1200]",
         "  ctx stats",
         "  ctx gc",
+        "  ctx reindex",
       ].join("\n"),
     );
   }
@@ -358,14 +423,17 @@ export async function runCtxCommand(commandLine, storage, config) {
     const asJson = hasFlag(args, "--json");
     const cleanArgs = stripFlags(args, ["--k"]);
     const k = clampInt(toInt(getFlagValue(args, "--k", config.searchDefaultK), config.searchDefaultK), 1, 50);
-    const query = cleanArgs.join(" ").trim();
+    const scope = String(getFlagValue(args, "--scope", "all") || "all").toLowerCase();
+    const query = stripFlags(cleanArgs, ["--scope"]).join(" ").trim();
     if (!query) {
       return errorResult('usage: ctx search "<query>" [--k 5]');
     }
     const queryTokens = tokenize(query);
-    const history = await storage.readHistory();
-    const newestTs = history.length ? Date.parse(String(history[history.length - 1].ts || "")) : Date.now();
-    const ranked = history
+    const { history, archive } = await readHistoryByScope(storage, scope);
+    const pool = mergeUniqueHistory(history, archive);
+    const hotIds = new Set(history.map((item) => String(item.id)));
+    const newestTs = pool.length ? Date.parse(String(pool[pool.length - 1].ts || "")) : Date.now();
+    const ranked = pool
       .map((entry) => ({
         entry,
         score: scoreEntry(entry, queryTokens, newestTs),
@@ -379,6 +447,7 @@ export async function runCtxCommand(commandLine, storage, config) {
       ts: isoMaybe(entry.ts),
       type: entry.type || "note",
       summary: lineSummary(entry.text, config.searchSummaryMaxChars),
+      source: hotIds.has(String(entry.id)) ? "hot" : "archive",
       score: Number(score.toFixed(3)),
     }));
 
@@ -391,13 +460,13 @@ export async function runCtxCommand(commandLine, storage, config) {
     }));
 
     if (asJson) {
-      return textResult(JSON.stringify({ query, k, hits: rows.length, results: rows }, null, 2));
+      return textResult(JSON.stringify({ query, k, scope, hits: rows.length, results: rows }, null, 2));
     }
 
     const lines = [
-      `# search (${rows.length} hits)`,
+      `# search (${rows.length} hits, scope=${scope})`,
       "",
-      ...rows.map((x) => `${x.id} | ${x.ts} | ${x.type} | ${x.summary}`),
+      ...rows.map((x) => `${x.id} | ${x.ts} | ${x.type} | ${x.source} | ${x.summary}`),
     ];
     return textResult(lines.join("\n"));
   }
@@ -420,21 +489,26 @@ export async function runCtxCommand(commandLine, storage, config) {
       20,
     );
     const history = await storage.readHistory();
-    const matches = findIdMatches(history, anchorId);
+    const archive = asArchiveSearchRows(await storage.readHistoryArchiveIndex());
+    const hotMatches = findIdMatches(history, anchorId);
+    const archiveMatches = findIdMatches(archive, anchorId);
+    const sourceList = hotMatches.length ? history : archive;
+    const matches = hotMatches.length ? hotMatches : archiveMatches;
     if (!matches.length) {
       return errorResult(`id not found: ${anchorId}`);
     }
     if (matches.length > 1) {
       return errorResult(`id conflict: ${anchorId}. run ctx gc or migration to repair duplicate ids`);
     }
-    const index = history.findIndex((item) => String(item.id) === String(anchorId));
+    const index = sourceList.findIndex((item) => String(item.id) === String(anchorId));
     const start = Math.max(0, index - before);
-    const end = Math.min(history.length, index + after + 1);
-    const slice = history.slice(start, end).map((entry) => ({
+    const end = Math.min(sourceList.length, index + after + 1);
+    const slice = sourceList.slice(start, end).map((entry) => ({
       id: entry.id,
       ts: isoMaybe(entry.ts),
       type: entry.type || "note",
       summary: lineSummary(entry.text, config.searchSummaryMaxChars),
+      source: hotMatches.length ? "hot" : "archive",
     }));
 
     await storage.updateState((cur) => ({
@@ -443,12 +517,12 @@ export async function runCtxCommand(commandLine, storage, config) {
     }));
 
     if (asJson) {
-      return textResult(JSON.stringify({ anchor: anchorId, before, after, results: slice }, null, 2));
+      return textResult(JSON.stringify({ anchor: anchorId, before, after, source: hotMatches.length ? "hot" : "archive", results: slice }, null, 2));
     }
     const lines = [
       `# timeline ${anchorId}`,
       "",
-      ...slice.map((x) => `${x.id} | ${x.ts} | ${x.type} | ${x.summary}`),
+      ...slice.map((x) => `${x.id} | ${x.ts} | ${x.type} | ${x.source} | ${x.summary}`),
     ];
     return textResult(lines.join("\n"));
   }
@@ -462,7 +536,9 @@ export async function runCtxCommand(commandLine, storage, config) {
     }
     const head = clampInt(toInt(getFlagValue(args, "--head", config.getDefaultHead), config.getDefaultHead), 0, 200000);
     const history = await storage.readHistory();
-    const matches = findIdMatches(history, id);
+    const hotMatches = findIdMatches(history, id);
+    const archiveRow = await storage.findHistoryArchiveById(id);
+    const matches = hotMatches.length ? hotMatches : (archiveRow ? [archiveRow] : []);
     if (!matches.length) {
       return errorResult(`id not found: ${id}`);
     }
@@ -470,6 +546,7 @@ export async function runCtxCommand(commandLine, storage, config) {
       return errorResult(`id conflict: ${id}. run ctx gc or migration to repair duplicate ids`);
     }
     const row = matches[0];
+    const source = hotMatches.length ? "hot" : "archive";
     await storage.updateState((cur) => ({
       getCount: (cur.getCount || 0) + 1,
     }));
@@ -477,6 +554,7 @@ export async function runCtxCommand(commandLine, storage, config) {
       const jsonBudget = head > 0 ? head : config.getDefaultHead;
       const base = {
         record: row,
+        source,
         head: jsonBudget,
         original_text_len: String(row.text || "").length,
       };
@@ -559,7 +637,7 @@ export async function runCtxCommand(commandLine, storage, config) {
       }
       return textResult(json);
     }
-    const full = JSON.stringify(row, null, 2);
+    const full = JSON.stringify({ source, record: row }, null, 2);
     const clipped = head > 0 ? `${full.slice(0, head)}${full.length > head ? "\n..." : ""}` : full;
     return textResult(clipped);
   }
@@ -574,6 +652,18 @@ export async function runCtxCommand(commandLine, storage, config) {
     );
     await storage.refreshManifest();
     return textResult(`gc done; compacted=${String(compact.compacted)}; pins=${deduped.length}`);
+  }
+
+  if (cmd === "reindex") {
+    const result = await storage.rebuildHistoryArchiveIndex();
+    return textResult(
+      [
+        "reindex done",
+        `- rebuilt: ${String(result.rebuilt)}`,
+        `- archive_entries: ${result.archiveEntries}`,
+        `- index_entries: ${result.indexEntries}`,
+      ].join("\n"),
+    );
   }
 
   return errorResult(`unknown ctx command: ${cmd}`);
