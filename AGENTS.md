@@ -1,159 +1,168 @@
 # AGENTS.md
 
-Repository playbook for coding agents working in `D:\code\python_code\ContextFS`.
-All commands and conventions below are grounded in current repository files.
+Agent playbook for `D:\code\python_code\ContextFS`.
+Use this as the authoritative quick-start for coding, testing, and style in this repo.
 
-## 1) Repository Map
-
-- Core plugin runtime: `.opencode/plugins/contextfs/src/*.mjs`
-- Plugin entry: `.opencode/plugins/contextfs.plugin.mjs`
-- CLI entry: `.opencode/plugins/contextfs/cli.mjs`
-- Tool bridge (TS): `.opencode/tools/contextfs.ts`
-- Plugin tests: `.opencode/plugins/contextfs/test/contextfs.test.mjs`
-- Regression script: `scripts/regression-contextfs.mjs`
-- Bench scripts: `bench/*.mjs`
-- Bench tests: `bench/bench.test.mjs`
-- Repo docs: `README.md`, `.opencode/plugins/contextfs/README.md`
-
-## 2) Runtime / Stack Facts
-
-- Plugin package is ESM (`"type": "module"` in `.opencode/plugins/contextfs/package.json`).
-- Runtime implementation is plain `.mjs` (Node.js), no transpile/build pipeline.
-- TypeScript is only used for the OpenCode tool bridge (`.opencode/tools/contextfs.ts`).
-- Tests use Node's built-in test runner (`node --test`), not Jest/Vitest.
-
-## 3) Authoritative Command Sources
+## 1) Repo Layout
 
 - Root scripts: `package.json`
-- Plugin scripts: `.opencode/plugins/contextfs/package.json`
-- Command examples: `README.md`
-- Test naming patterns: `.opencode/plugins/contextfs/test/contextfs.test.mjs`, `bench/bench.test.mjs`
+- Plugin package: `.opencode/plugins/contextfs/package.json`
+- Plugin entry: `.opencode/plugins/contextfs.plugin.mjs`
+- CLI entry: `.opencode/plugins/contextfs/cli.mjs`
+- Runtime source: `.opencode/plugins/contextfs/src/*.mjs`
+- Tool bridge (TypeScript): `.opencode/tools/contextfs.ts`
+- Unit tests: `.opencode/plugins/contextfs/test/contextfs.test.mjs`
+- Regression script: `scripts/regression-contextfs.mjs`
+- Bench scripts/tests: `bench/*.mjs`
+- User docs: `README.md`
 
-## 4) Install / Build / Lint / Test Commands
+## 2) Stack Facts
 
-### Install
+- Node.js project, plugin is ESM (`"type": "module"`).
+- Runtime logic is plain `.mjs`; no transpile/build pipeline.
+- Tests use Node built-in test runner (`node --test`).
 
-- `npm install`
-- `npm install --prefix .opencode/plugins/contextfs` (plugin-local install when needed)
+## 3) Rule Files (Cursor / Copilot)
 
-### Build
-
-- No `build` script in root `package.json`.
-- No transpilation step for plugin runtime.
-
-### Lint / Format
-
-- No lint script defined in `package.json`.
-- No ESLint / Prettier / Biome config detected.
-- Follow existing file style; do not add new lint/format tooling unless requested.
-
-### Tests (full)
-
-- Unit (root entrypoint): `npm run test:contextfs:unit`
-- Regression: `npm run test:contextfs:regression`
-- Plugin-local unit: `npm test --prefix .opencode/plugins/contextfs`
-- Bench test suite: `node --test bench/bench.test.mjs`
-
-### Tests (single test)
-
-- Single plugin test from repo root:
-  - `node --test --test-name-pattern="appendHistory handles 15 concurrent writes" ./.opencode/plugins/contextfs/test/contextfs.test.mjs`
-- Single bench test from repo root:
-  - `node --test --test-name-pattern="timing fields are sane in jsonl outputs" ./bench/bench.test.mjs`
-- Single plugin test from plugin dir:
-  - `node --test --test-name-pattern="writeText waits for lock release and retries" ./test/contextfs.test.mjs`
-
-### Bench runs
-
-- ContextFS E2E: `npm run bench:e2e -- --turns 3000 --avgChars 400 --variance 0.6 --seed 42`
-- Naive baseline: `npm run bench:naive -- --turns 3000 --avgChars 400 --variance 0.6 --seed 42`
-- AB comparison: `npm run bench -- --turns 3000 --avgChars 400 --variance 0.6 --seed 42 --orders 1`
-- AB+BA comparison: `npm run bench -- --turns 3000 --avgChars 400 --variance 0.6 --seed 42 --orders 2`
-
-### CLI sanity checks
-
-- `node .opencode/plugins/contextfs/cli.mjs ls`
-- `node .opencode/plugins/contextfs/cli.mjs stats`
-- `node .opencode/plugins/contextfs/cli.mjs search "lock timeout" --k 5`
-- `node .opencode/plugins/contextfs/cli.mjs timeline H-abc12345 --before 3 --after 3`
-- `node .opencode/plugins/contextfs/cli.mjs get H-abc12345 --head 1200`
-- `node .opencode/plugins/contextfs/cli.mjs pack`
-
-## 5) Cursor / Copilot Rules
+Checked paths:
 
 - `.cursorrules`: not found
 - `.cursor/rules/`: not found
 - `.github/copilot-instructions.md`: not found
 
-If these files are added later, treat them as higher-priority local policy and update this file.
+If any of these appear later, treat them as higher-priority local instructions and update this file.
 
-## 6) Code Style (Observed Conventions)
+## 4) Install / Build / Lint / Test
+
+### Install
+
+- Root install: `npm install`
+- Plugin-only install (if needed): `npm install --prefix .opencode/plugins/contextfs`
+
+### Build
+
+- No build script exists in root `package.json`.
+- No compile step required for plugin runtime.
+
+### Lint / Format
+
+- No lint script exists in root or plugin `package.json`.
+- No ESLint/Prettier/Biome config detected.
+- Follow existing style exactly; do not introduce new tooling unless requested.
+
+### Test (full suites)
+
+- Root unit entry: `npm run test:contextfs:unit`
+- Root regression entry: `npm run test:contextfs:regression`
+- Plugin unit direct: `npm test --prefix .opencode/plugins/contextfs`
+- Bench tests: `node --test bench/bench.test.mjs`
+
+### Test (single test)
+
+Run one test by name pattern:
+
+- Plugin test from repo root:
+  - `node --test --test-name-pattern="compacted turns remain retrievable via archive fallback" ./.opencode/plugins/contextfs/test/contextfs.test.mjs`
+- Another plugin example:
+  - `node --test --test-name-pattern="ctx reindex preserves raw duplicate archive ids for get/search consistency" ./.opencode/plugins/contextfs/test/contextfs.test.mjs`
+- Bench single test:
+  - `node --test --test-name-pattern="timing fields are sane in jsonl outputs" ./bench/bench.test.mjs`
+
+### Bench commands
+
+- `npm run bench:e2e -- --turns 3000 --avgChars 400 --variance 0.6 --seed 42`
+- `npm run bench:naive -- --turns 3000 --avgChars 400 --variance 0.6 --seed 42`
+- `npm run bench -- --turns 3000 --avgChars 400 --variance 0.6 --seed 42 --orders 2`
+
+## 5) ContextFS CLI Sanity Commands
+
+- `node .opencode/plugins/contextfs/cli.mjs ls`
+- `node .opencode/plugins/contextfs/cli.mjs stats`
+- `node .opencode/plugins/contextfs/cli.mjs search "lock timeout" --k 5 --scope all`
+- `node .opencode/plugins/contextfs/cli.mjs timeline H-abc12345 --before 3 --after 3`
+- `node .opencode/plugins/contextfs/cli.mjs get H-abc12345 --head 1200`
+- `node .opencode/plugins/contextfs/cli.mjs reindex`
+
+## 6) Coding Conventions (Observed)
 
 ### Imports
 
-- Use ESM imports with double quotes.
-- Import Node built-ins via `node:` specifiers.
-- Group imports by origin (built-ins, then local), with a blank line between groups when both exist.
+- Use ESM imports.
+- Use `node:` specifiers for Node built-ins.
+- Keep built-in imports before local imports, separated by one blank line.
+- Use double quotes and trailing semicolons.
 
 ### Formatting
 
-- Semicolons are used consistently.
 - Two-space indentation.
-- Trailing commas in multiline literals/calls.
-- Prefer small helpers + early returns to keep nesting shallow.
+- Semicolons enabled.
+- Prefer trailing commas in multiline arrays/objects/calls.
+- Prefer early returns and small helpers over deep nesting.
 
 ### Naming
 
-- Functions/variables: `camelCase` (examples: `mergeConfig`, `safeTrim`, `maybeCompact`).
+- Variables/functions: `camelCase`.
 - Classes: `PascalCase` (example: `ContextFsStorage`).
-- Module constants: `UPPER_SNAKE_CASE` (examples: `DEFAULT_CONFIG`, `FILES`, `RETRYABLE_LOCK_ERRORS`).
-- Tests: sentence-style names in `test("...", ...)`.
+- Constants: `UPPER_SNAKE_CASE` (`FILES`, `RETRYABLE_LOCK_ERRORS`).
+- Test names: descriptive sentence-style strings in `test("...", ...)`.
 
-### Types and Validation
+### Types and Input Handling
 
-- Normalize user/runtime input explicitly (`String(...)`, `Number(...)`, boolean parsing).
-- Clamp numeric config values at boundaries (`clampInt`).
-- In `.opencode/tools/contextfs.ts`, keep typed function signatures; avoid `any` escape hatches.
+- Normalize all external input (`String(...)`, `Number(...)`, trim, guards).
+- Validate and clamp config values at boundaries.
+- Avoid `any` in TypeScript bridge code unless explicitly justified.
+- Keep runtime schemas stable (history/index rows have explicit fields).
 
-### Async / Concurrency / I/O
+### Async, I/O, and Concurrency
 
-- Prefer `async/await`.
-- Storage writes are lock-aware (`acquireLock`, `releaseLock`).
-- Atomic write pattern is used where needed (temp file then rename).
-- History format is NDJSON (`history.ndjson`), one JSON object per line.
+- Use `async/await` consistently.
+- Use lock-aware writes via storage helpers.
+- Keep atomic write behavior for files requiring consistency.
+- History files are NDJSON (one JSON object per line).
+- Archive behavior:
+  - `history.ndjson` = hot recent turns
+  - `history.archive.ndjson` = compacted historical rows
+  - `history.archive.index.ndjson` = retrieval index for archive rows
 
 ### Error Handling
 
-- Throw explicit errors for hard failures (example: lock timeout path).
-- Use narrow `try/finally` for lock release and temp file cleanup.
-- CLI catches top-level errors, writes to stderr, and sets `process.exitCode = 1`.
-- Do not silently swallow non-optional errors.
+- Throw explicit errors for hard failures.
+- Use narrow `try/finally` blocks for lock release/cleanup.
+- Do not silently swallow unexpected errors.
+- CLI layer should return structured error results and non-zero exit on fatal failure.
 
-### Strings and Output
+### Output and UX
 
-- Prefer template literals for composed output.
-- Keep CLI output line-oriented and readable.
-- Preserve stable markdown/json headers and trailing newline conventions in persisted files.
+- Keep CLI output stable and line-oriented.
+- JSON output must remain parseable and backward-safe where possible.
 
-### Test Style
 
-- Use `node:test` + `node:assert/strict`.
-- Create temp directories and always clean up in `finally`.
-- For concurrency tests, assert both operation success and file parse integrity.
-- For schema/timing tests, validate nested key parity and timing invariants.
+## 7) Testing Expectations by Change Type
 
-## 7) Agent Guardrails for This Repo
+- If changing `src/storage.mjs`, `src/compactor.mjs`, or retrieval logic:
+  - Run `npm run test:contextfs:unit`
+  - Run `npm run test:contextfs:regression`
+- If changing bench code:
+  - Run `node --test bench/bench.test.mjs`
+  - Run at least one bench command
+- If changing CLI behavior:
+  - Run at least one `cli.mjs` sanity command from section 5
 
-- Keep edits focused; avoid broad refactors unless requested.
-- Match existing `.mjs` patterns before introducing new abstractions.
-- If storage/compaction logic changes, run unit + regression suites.
-- If bench logic changes, run `node --test bench/bench.test.mjs` and at least one `npm run bench ...` command.
-- Update README docs when user-visible behavior or commands change.
+## 8) Agent Guardrails
 
-## 8) Quick Execution Checklist
+- Keep edits focused; do not refactor unrelated modules.
+- Preserve existing CLI contract unless change is explicitly requested.
+- Update `README.md` when user-visible behavior/flags change.
+- Never commit secrets or generated runtime state (`.contextfs/`, lock files).
 
-1. Read `package.json` and `.opencode/plugins/contextfs/package.json` first.
-2. Run `npm run test:contextfs:unit` before/after core logic changes.
-3. Run `npm run test:contextfs:regression` after storage/compaction/retrieval changes.
-4. Run bench tests when touching `bench/*`.
-5. Keep this `AGENTS.md` synchronized with actual scripts and behavior.
+## 9) Repo-Specific Notes
+
+- `.contextfs/` is runtime data and ignored.
+- `docs/` is currently ignored in `.gitignore`; use `git add -f` only when docs must be committed.
+- When adding new commands/flags, update both docs and tests in the same change.
+
+## 10) Quick Checklist Before Hand-off
+
+1. Commands verified from `package.json` files (root + plugin).
+2. Relevant tests run (full or single-target with `--test-name-pattern`).
+3. README/AGENTS updated if behavior or workflow changed.
