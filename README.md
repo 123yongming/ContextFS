@@ -5,14 +5,16 @@ ContextFS 是一个为 OpenCode 设计的轻量级上下文管理插件，解决
 ## 核心功能
 
 ### 1. 上下文结构化管理
-在 `.contextfs/` 目录维护 4 类关键文件：
+在 `.contextfs/` 目录维护关键文件：
 
 | 文件 | 用途 |
 |------|------|
 | `manifest.md` | 项目结构和待办事项清单 |
 | `pins.md` | 关键约束/规则的固定记忆 |
 | `summary.md` | 历史对话的滚动摘要（压缩后的旧历史） |
-| `history.ndjson` | 最近 N 轮对话的详细记录 |
+| `history.ndjson` | 最近 N 轮对话的详细记录（hot 区） |
+| `history.archive.ndjson` | 被压缩后的历史归档（archive 区） |
+| `history.archive.index.ndjson` | 归档检索索引（用于快速 search/timeline） |
 
 ### 2. 智能上下文 Pack
 每轮对话自动组装结构化的 Context Pack：
@@ -29,9 +31,16 @@ ContextFS 是一个为 OpenCode 设计的轻量级上下文管理插件，解决
 ### 3. 自动压缩机制
 - 当估算 token 数超过阈值（默认 8000）时自动触发
 - 将旧历史压缩成 bullet points 并入 `summary.md`
-- 只保留最近 N 轮完整对话，保证上下文体积始终可控
+- 同时把被压缩的完整历史写入 archive，避免“压缩后无法检索”
+- 只保留最近 N 轮完整对话在 hot 区，保证上下文体积始终可控
 
-### 4. Pins 管理
+### 4. 三段式检索（支持 hot + archive）
+- `ctx search` 支持 `--scope all|hot|archive`，可按范围检索
+- `ctx timeline` 命中后可继续查看上下文窗口（含 archive）
+- `ctx get` 可按 id 读取完整记录，支持 archive 回退
+- 输出里会标注 `source`（`hot` 或 `archive`），便于快速判断来源
+
+### 5. Pins 管理
 - 手动添加关键约束
 - 自动去重（完全重复和前缀重复）
 - 持久化存储，跨会话保留
@@ -52,8 +61,11 @@ cp -r <path-to-contextfs>/.opencode/plugins/contextfs .opencode/plugins/
 # 查看状态
 node .opencode/plugins/contextfs/cli.mjs ls
 
-# 检索索引（轻量、限长）
+# 检索索引（默认 scope=all）
 node .opencode/plugins/contextfs/cli.mjs search "lock timeout" --k 5
+
+# 仅检索 archive
+node .opencode/plugins/contextfs/cli.mjs search "lock timeout" --scope archive --k 5
 
 # 按 id 查看上下文窗口
 node .opencode/plugins/contextfs/cli.mjs timeline H-abc12345 --before 3 --after 3
@@ -70,6 +82,9 @@ node .opencode/plugins/contextfs/cli.mjs pin "不要修改核心架构"
 # 手动压缩
 node .opencode/plugins/contextfs/cli.mjs compact
 
+# 重建 archive 索引（索引损坏/迁移后使用）
+node .opencode/plugins/contextfs/cli.mjs reindex
+
 # 查看当前 Pack
 node .opencode/plugins/contextfs/cli.mjs pack
 ```
@@ -78,11 +93,20 @@ node .opencode/plugins/contextfs/cli.mjs pack
 
 在长会话中建议采用三段式：
 
-1. `ctx search "<query>"`：先拿轻量索引（`id | ts | type | one-line summary`）
-2. `ctx timeline <id>`：看命中条目前后窗口，确认上下文
+1. `ctx search "<query>" --scope all`：先拿轻量索引（`id | ts | type | source | one-line summary`）
+2. `ctx timeline <id>`：看命中条目前后窗口，确认上下文（hot/archive 都可）
 3. `ctx get <id>`：仅在需要细节时拉取完整记录
 
-这样可以减少 token 浪费，避免 pack 中塞入无关全文。
+这样可以减少 token 浪费，避免 pack 中塞入无关全文；同时即使历史已压缩进 archive，仍可被检索和回放。
+
+## 新增能力（本分支）
+
+- 压缩后可检索：旧记录进入 archive 后，`search/timeline/get` 仍可命中
+- 检索范围可控：`search` 新增 `--scope all|hot|archive`
+- 结果来源可见：检索和时间线结果新增 `source` 字段
+- 索引可修复：新增 `ctx reindex`，可重建 `history.archive.index.ndjson`
+- 一致性增强：重复 id 的 archive 记录保持原始 id，`get` 按“最后一条生效”返回
+- 中文检索改进：对 CJK 文本短语匹配更稳定（例如近义问法）
 
 ## 项目结构
 
