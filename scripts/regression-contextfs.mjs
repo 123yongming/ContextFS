@@ -97,10 +97,11 @@ async function test3() {
   const storage = new ContextFsStorage(workspace, config);
 
   for (let i = 1; i <= 10; i += 1) {
-    await plugin["message.updated"](
-      { event: { properties: { message: { role: i % 2 ? "user" : "assistant", text: `auto-off turn-${i}` } } } },
-      {},
-    );
+    await storage.appendHistory({
+      role: i % 2 ? "user" : "assistant",
+      text: `auto-off turn-${i}`,
+      ts: new Date().toISOString(),
+    });
   }
 
   const output = { context: [] };
@@ -117,6 +118,99 @@ async function test3() {
       historyBefore,
       historyAfter,
       compacted: compactResult.text.includes("compacted: true"),
+    },
+  };
+}
+
+async function test8() {
+  const workspace = await resetRuntime(".contextfs_rt_history_pairs");
+  globalThis.CONTEXTFS_CONFIG = {
+    contextfsDir: ".contextfs",
+    autoInject: false,
+    autoCompact: false,
+    recentTurns: 6,
+  };
+  const plugin = await ContextFSPlugin({ directory: workspace });
+  const config = mergeConfig(globalThis.CONTEXTFS_CONFIG);
+  const storage = new ContextFsStorage(workspace, config);
+
+  await plugin.event({
+    event: {
+      type: "tui.prompt.append",
+      properties: {
+        text: "interpret the current project plugin",
+      },
+    },
+  });
+
+  await plugin.event({
+    event: {
+      type: "message.updated",
+      properties: {
+        info: { id: "U-1", role: "user", summary: { title: "summary fallback should be ignored" } },
+      },
+    },
+  });
+
+  await plugin.event({
+    event: {
+      type: "message.updated",
+      properties: {
+        info: { id: "A-1", role: "assistant" },
+        message: { id: "A-1", role: "assistant", text: "intermediate draft 1" },
+      },
+    },
+  });
+
+  await plugin.event({
+    event: {
+      type: "message.updated",
+      properties: {
+        info: { id: "A-1", role: "assistant" },
+        message: { id: "A-1", role: "assistant", text: "intermediate draft 2" },
+      },
+    },
+  });
+
+  await plugin.event({
+    event: {
+      type: "message.updated",
+      properties: {
+        info: { id: "A-1", role: "assistant" },
+        message: { id: "A-1", role: "assistant", text: "final answer only" },
+      },
+    },
+  });
+
+  await plugin.event({
+    event: {
+      type: "message.updated",
+      properties: {
+        info: { id: "A-1", role: "assistant" },
+        message: { id: "A-1", role: "assistant", text: "final answer only" },
+      },
+    },
+  });
+
+  const history = await storage.readHistory();
+  const roles = history.map((item) => item.role);
+  const texts = history.map((item) => item.text);
+  const pass =
+    history.length === 2 &&
+    roles[0] === "user" &&
+    roles[1] === "assistant" &&
+    texts[0] === "interpret the current project plugin" &&
+    texts[1] === "final answer only" &&
+    !texts.some((text) => text.includes("summary fallback")) &&
+    !texts.some((text) => text.includes("intermediate draft"));
+
+  return {
+    id: "TEST-8",
+    pass,
+    metrics: {
+      historyCount: history.length,
+      roles: roles.join(","),
+      assistantText: texts[1] || "",
     },
   };
 }
@@ -332,7 +426,7 @@ function printTable(results) {
 }
 
 async function main() {
-  const results = [await test1(), await test2(), await test3(), await test4(), await test5(), await test6(), await test7()];
+  const results = [await test1(), await test2(), await test3(), await test4(), await test5(), await test6(), await test7(), await test8()];
   printTable(results);
   console.log("\n# JSON Summary\n");
   console.log(JSON.stringify({ allPass: results.every((x) => x.pass), results }, null, 2));
