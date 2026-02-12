@@ -267,10 +267,6 @@ function safeFileName(name) {
     "pins.md",
     "summary",
     "summary.md",
-    "decisions",
-    "decisions.md",
-    "tasks/current.md",
-    "current",
     "history",
     "history.ndjson",
     "history.archive.ndjson",
@@ -278,9 +274,6 @@ function safeFileName(name) {
   ]);
   if (!allowed.has(target)) {
     return null;
-  }
-  if (target === "current" || target === "tasks/current.md") {
-    return map.tasks;
   }
   if (target.endsWith(".md") || target.endsWith(".ndjson")) {
     return target;
@@ -385,7 +378,7 @@ export async function runCtxCommand(commandLine, storage, config) {
   if (cmd === "cat") {
     const target = safeFileName(args[0]);
     if (!target) {
-      return errorResult("unknown file. use manifest|pins|summary|decisions|tasks/current.md|history");
+      return errorResult("unknown file. use manifest|pins|summary|history");
     }
     const headIndex = args.indexOf("--head");
     const head = headIndex >= 0 ? toInt(args[headIndex + 1], 30) : null;

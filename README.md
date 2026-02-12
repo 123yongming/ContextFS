@@ -9,7 +9,7 @@ ContextFS 是一个为 OpenCode 设计的轻量级上下文管理插件，解决
 
 | 文件 | 用途 |
 |------|------|
-| `manifest.md` | 项目结构和待办事项清单 |
+| `manifest.md` | 项目结构和状态清单 |
 | `pins.md` | 关键约束/规则的固定记忆 |
 | `summary.md` | 历史对话的滚动摘要（压缩后的旧历史） |
 | `history.ndjson` | 最近 N 轮对话的详细记录（hot 区） |

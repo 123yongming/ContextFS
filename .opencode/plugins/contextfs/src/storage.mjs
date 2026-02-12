@@ -5,8 +5,6 @@ const FILES = {
   manifest: "manifest.md",
   pins: "pins.md",
   summary: "summary.md",
-  decisions: "decisions.md",
-  tasks: path.join("tasks", "current.md"),
   history: "history.ndjson",
   historyArchive: "history.archive.ndjson",
   historyArchiveIndex: "history.archive.index.ndjson",
@@ -362,13 +360,10 @@ export class ContextFsStorage {
 
   async ensureInitialized() {
     await fs.mkdir(this.baseDir, { recursive: true });
-    await fs.mkdir(path.join(this.baseDir, "tasks"), { recursive: true });
 
     await this.ensureFile("manifest", this.defaultManifest());
     await this.ensureFile("pins", this.defaultPins());
     await this.ensureFile("summary", this.defaultSummary());
-    await this.ensureFile("decisions", this.defaultDecisions());
-    await this.ensureFile("tasks", this.defaultTask());
     await this.ensureFile("history", "");
     await this.ensureFile("historyArchive", "");
     await this.ensureFile("historyArchiveIndex", "");
@@ -775,8 +770,6 @@ export class ContextFsStorage {
       "## files",
       "- pins.md | key constraints and prohibitions | tags: pins,policy",
       "- summary.md | rolling compact summary | tags: memory,compact",
-      "- decisions.md | long-form decisions and rationale | tags: decision,log",
-      "- tasks/current.md | current task status | tags: task,short",
       "- history.ndjson | compactable turn history | tags: runtime,history",
       "- history.archive.ndjson | archived compacted turn history | tags: runtime,archive",
       "- history.archive.index.ndjson | archive retrieval index | tags: runtime,index",
@@ -793,7 +786,7 @@ export class ContextFsStorage {
   }
 
   defaultManifest() {
-    return "# ContextFS Manifest\n\n- updated: pending\n- revision: 0\n\n## files\n- pins.md\n- summary.md\n- decisions.md\n- tasks/current.md\n";
+    return "# ContextFS Manifest\n\n- updated: pending\n- revision: 0\n\n## files\n- pins.md\n- summary.md\n";
   }
 
   defaultPins() {
@@ -804,13 +797,6 @@ export class ContextFsStorage {
     return "# Rolling Summary\n\n- init: no summary yet.\n";
   }
 
-  defaultDecisions() {
-    return "# Decisions\n\n| Time | Decision | Reason |\n|---|---|---|\n";
-  }
-
-  defaultTask() {
-    return "# Current Task\n\n- status: idle\n";
-  }
 
   defaultState() {
     return {
