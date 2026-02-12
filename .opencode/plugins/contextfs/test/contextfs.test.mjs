@@ -129,6 +129,52 @@ test("appendHistory handles 15 concurrent writes without corrupting ndjson", asy
   });
 });
 
+test("updateHistoryEntryById keeps concurrent append and updates target atomically", async () => {
+  await withTempStorage(async ({ storage }) => {
+    await storage.appendHistory({
+      role: "user",
+      text: "seed-user",
+      ts: "2026-02-12T00:00:00.000Z",
+    });
+    const target = await storage.appendHistory({
+      role: "assistant",
+      text: "seed-assistant",
+      ts: "2026-02-12T00:00:01.000Z",
+    });
+
+    const originalWriteWithLock = storage.writeTextWithLock.bind(storage);
+    storage.writeTextWithLock = async (name, content) => {
+      if (name === "history") {
+        await new Promise((resolve) => setTimeout(resolve, 120));
+      }
+      return originalWriteWithLock(name, content);
+    };
+
+    const updateTask = storage.updateHistoryEntryById(target.id, {
+      text: "updated-assistant",
+      role: "assistant",
+    });
+    const appendTask = (async () => {
+      await new Promise((resolve) => setTimeout(resolve, 30));
+      await storage.appendHistory({
+        role: "user",
+        text: "concurrent-append",
+        ts: "2026-02-12T00:00:02.000Z",
+      });
+    })();
+
+    const [updated] = await Promise.all([updateTask, appendTask]);
+    assert.ok(updated);
+    assert.equal(updated.id, target.id);
+    assert.equal(updated.text, "updated-assistant");
+
+    const history = await storage.readHistory();
+    assert.equal(history.length, 3);
+    assert.equal(history.some((item) => item.id === target.id && item.text === "updated-assistant"), true);
+    assert.equal(history.some((item) => item.text === "concurrent-append"), true);
+  });
+});
+
 test("writeText replaces target atomically under concurrent writes", async () => {
   await withTempStorage(async ({ storage }) => {
     const payloadA = `BEGIN_A\n${"A".repeat(50000)}\nEND_A\n`;
