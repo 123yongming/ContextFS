@@ -4,11 +4,13 @@ Small, non-invasive OpenCode plugin to keep long sessions stable.
 
 ## Core Features
 
-- **Context Management**: Maintains 4 types of files in `.contextfs/`
-  - `manifest.md` - Project structure
+- **Context Management**: Maintains core files in `.contextfs/`
+  - `manifest.md` - Project structure/status
   - `pins.md` - Key constraints/pins
   - `summary.md` - Rolling summary of compressed history
   - `history.ndjson` - Recent N turns (NDJSON format)
+  - `history.archive.ndjson` - Archived compacted turns
+  - `history.archive.index.ndjson` - Archive retrieval index
 
 - **Context Pack**: Builds fixed pack each turn
   - PINS (max 20 items)
