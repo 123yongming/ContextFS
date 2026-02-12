@@ -716,6 +716,43 @@ export class ContextFsStorage {
     await this.writeText("history", serializeHistoryEntries(normalized));
   }
 
+  async updateHistoryEntryById(id, updaterOrPatch) {
+    const targetId = safeTrim(id);
+    if (!targetId) {
+      return null;
+    }
+    const lock = await this.acquireLock();
+    try {
+      const raw = await this.readText("history");
+      const parsed = parseHistoryText(raw);
+      const idx = parsed.entries.findIndex((item) => String(item.id) === targetId);
+      if (idx < 0) {
+        return null;
+      }
+
+      const current = parsed.entries[idx];
+      const patchRaw =
+        typeof updaterOrPatch === "function"
+          ? (updaterOrPatch({ ...current }) || {})
+          : (updaterOrPatch || {});
+      const patch = patchRaw && typeof patchRaw === "object" ? patchRaw : {};
+
+      const nextEntryInput = {
+        ...current,
+        ...patch,
+        id: current.id,
+      };
+      const normalized = normalizeEntry(nextEntryInput, current.ts);
+      normalized.id = current.id;
+      parsed.entries[idx] = normalized;
+
+      await this.writeTextWithLock("history", serializeHistoryEntries(parsed.entries));
+      return normalized;
+    } finally {
+      await this.releaseLock(lock);
+    }
+  }
+
   async appendHistory(entry) {
     const lock = await this.acquireLock();
     try {

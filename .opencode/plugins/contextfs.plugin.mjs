@@ -65,13 +65,49 @@ function textFromMessage(payload) {
   return "";
 }
 
-function roleFromMessage(payload, fallback = "unknown") {
-  return (
-    payload?.role ||
-    payload?.author ||
-    payload?.message?.role ||
-    fallback
-  );
+function normalizeMessageRole(value, fallback = "unknown") {
+  const role = String(value || "").trim().toLowerCase();
+  if (!role) {
+    return fallback;
+  }
+  if (role === "human") {
+    return "user";
+  }
+  if (role === "ai") {
+    return "assistant";
+  }
+  return role;
+}
+
+function isSummaryFallbackText(text) {
+  const clean = String(text || "").trim();
+  if (!clean) {
+    return false;
+  }
+  return /^\[user-summary\]/i.test(clean);
+}
+
+function extractUserTextFromParts(parts) {
+  const list = Array.isArray(parts) ? parts : [];
+  const rows = [];
+  for (const part of list) {
+    if (!part || typeof part !== "object") {
+      continue;
+    }
+    if (part.type === "text" && typeof part.text === "string") {
+      const text = part.text.trim();
+      if (text) {
+        rows.push(text);
+      }
+    }
+    if (typeof part.prompt === "string") {
+      const text = part.prompt.trim();
+      if (text) {
+        rows.push(text);
+      }
+    }
+  }
+  return rows.join("\n").trim();
 }
 
 function appendPrompt(output, text) {
@@ -106,9 +142,9 @@ function setCommandOutput(output, result) {
 async function recordTurn(storage, role, text) {
   const clean = String(text || "").trim();
   if (!clean) {
-    return;
+    return null;
   }
-  await storage.appendHistory({
+  return storage.appendHistory({
     role: role || "unknown",
     text: clean,
     ts: new Date().toISOString(),
@@ -127,6 +163,11 @@ export const ContextFSPlugin = async ({ directory }) => {
 
   // Buffer streaming deltas by message id to avoid writing every chunk
   const streamBuf = new Map(); // msgId -> { text, updatedAt }
+  const assistantEventTextById = new Map();
+  let activeTurnUserText = "";
+  let activeTurnUserId = null;
+  let activeTurnAssistantId = null;
+  let activeTurnAssistantText = "";
   let partEventCount = 0;
 
   function getMsgIdFromInfo(info) {
@@ -147,11 +188,220 @@ export const ContextFSPlugin = async ({ directory }) => {
     return "";
   }
 
+  function extractMessageUpdatedMeta(payload) {
+    const evt = payload?.event || payload || {};
+    const props = evt.properties || evt.props || payload?.properties || {};
+    const message = props.message || props.msg || props.data || (evt.type ? props : evt) || {};
+    const info = props.info || message?.info || props.meta || {};
+    const role = normalizeMessageRole(
+      info?.role ||
+      info?.author ||
+      message?.role ||
+      message?.author ||
+      "unknown",
+      "unknown",
+    );
+    const msgId =
+      getMsgIdFromInfo(info) ||
+      getMsgIdFromInfo(message) ||
+      message?.id ||
+      message?.messageID ||
+      message?.messageId ||
+      message?.message_id ||
+      null;
+    const finished =
+      info?.finish === "stop" ||
+      Boolean(info?.time?.completed) ||
+      message?.finish === "stop" ||
+      Boolean(message?.time?.completed);
+    const title = String(info?.summary?.title || message?.summary?.title || "").trim();
+    const text = String(
+      textFromMessage(message) ||
+      textFromMessage(props.delta) ||
+      textFromMessage(info?.delta) ||
+      "",
+    ).trim();
+    return { role, msgId, finished, title, text, info, props };
+  }
+
+  function extractPromptInputText(input) {
+    const src = input && typeof input === "object" ? input : {};
+    const candidates = [
+      src.text,
+      src.properties?.text,
+      src.event?.properties?.text,
+      src.prompt,
+      src.query,
+      src.input,
+      src.value,
+      src.message,
+      src.message?.text,
+      src.message?.content,
+      src.prompt?.text,
+      src.prompt?.content,
+      src.prompt?.message,
+      src.parts,
+      src.output?.parts,
+      src.event?.properties?.parts,
+    ];
+    for (const candidate of candidates) {
+      const text =
+        Array.isArray(candidate)
+          ? extractUserTextFromParts(candidate)
+          : String(textFromMessage(candidate) || "").trim();
+      if (!text) {
+        continue;
+      }
+      if (isSummaryFallbackText(text)) {
+        continue;
+      }
+      if (text.includes(config.packDelimiterStart) || text.includes(config.packDelimiterEnd)) {
+        continue;
+      }
+      return text;
+    }
+    return "";
+  }
+
+  function beginTurnWithUserText(text, source = "unknown") {
+    const clean = String(text || "").trim();
+    if (!clean) {
+      return false;
+    }
+    if (isSummaryFallbackText(clean)) {
+      return false;
+    }
+    if (clean.includes(config.packDelimiterStart) || clean.includes(config.packDelimiterEnd)) {
+      return false;
+    }
+    if (clean === activeTurnUserText && !activeTurnAssistantId) {
+      return false;
+    }
+    activeTurnUserText = clean;
+    activeTurnUserId = null;
+    activeTurnAssistantId = null;
+    activeTurnAssistantText = "";
+    logDebug("turn begin", { source, textLen: clean.length });
+    return true;
+  }
+
+  function rememberAssistantEventText(msgId, text) {
+    const cleanId = String(msgId || "").trim();
+    if (!cleanId) {
+      return false;
+    }
+    const cleanText = String(text || "").trim();
+    if (assistantEventTextById.get(cleanId) === cleanText) {
+      return true;
+    }
+    assistantEventTextById.set(cleanId, cleanText);
+    if (assistantEventTextById.size > 4096) {
+      const first = assistantEventTextById.keys().next().value;
+      if (first) {
+        assistantEventTextById.delete(first);
+      }
+    }
+    return false;
+  }
+
+  async function replaceHistoryEntryText(entryId, role, text) {
+    const targetId = String(entryId || "").trim();
+    if (!targetId) {
+      return null;
+    }
+    const cleanRole = normalizeMessageRole(role, "assistant");
+    const cleanText = String(text || "").trim();
+    if (!cleanText) {
+      return null;
+    }
+    return storage.updateHistoryEntryById(targetId, {
+      role: cleanRole,
+      text: cleanText,
+      ts: new Date().toISOString(),
+    });
+  }
+
+  async function upsertTurnWithAssistant(assistantText, msgId) {
+    const cleanAssistant = String(assistantText || "").trim();
+    if (!cleanAssistant) {
+      return false;
+    }
+    if (!activeTurnUserText) {
+      logDebug("assistant skipped without active user turn", {
+        msgId,
+        sample: cleanAssistant.slice(0, 240),
+      });
+      return false;
+    }
+    if (cleanAssistant === activeTurnAssistantText) {
+      return false;
+    }
+    if (rememberAssistantEventText(msgId, cleanAssistant)) {
+      return false;
+    }
+
+    if (!activeTurnAssistantId) {
+      const userRow = await recordTurn(storage, "user", activeTurnUserText);
+      activeTurnUserId = userRow?.id || null;
+      const assistantRow = await recordTurn(storage, "assistant", cleanAssistant);
+      activeTurnAssistantId = assistantRow?.id || null;
+      await addPinsFromText(storage, activeTurnUserText, config);
+    } else {
+      const updated = await replaceHistoryEntryText(activeTurnAssistantId, "assistant", cleanAssistant);
+      if (!updated) {
+        const assistantRow = await recordTurn(storage, "assistant", cleanAssistant);
+        activeTurnAssistantId = assistantRow?.id || null;
+      }
+    }
+
+    activeTurnAssistantText = cleanAssistant;
+    await addPinsFromText(storage, cleanAssistant, config);
+    await autoCompactIfNeeded();
+    await storage.refreshManifest();
+    return true;
+  }
+
   async function autoCompactIfNeeded() {
     if (!config.autoCompact) {
       return;
     }
     await maybeCompact(storage, config, false);
+  }
+
+  async function handleMessageUpdated(payload) {
+    const meta = extractMessageUpdatedMeta(payload);
+
+    if (meta.role === "user") {
+      if (beginTurnWithUserText(meta.text, "message.updated:user")) {
+        logDebug("user queued", {
+          msgId: meta.msgId,
+          textLen: String(meta.text || "").trim().length,
+        });
+      }
+      return;
+    }
+
+    if (meta.role !== "assistant") {
+      return;
+    }
+
+    let assistantText = meta.text;
+    if (meta.msgId && streamBuf.has(meta.msgId)) {
+      const buf = streamBuf.get(meta.msgId);
+      if (meta.finished) {
+        streamBuf.delete(meta.msgId);
+      }
+      assistantText = String(buf?.text || "").trim() || assistantText;
+    }
+
+    const flushed = await upsertTurnWithAssistant(assistantText, meta.msgId);
+    if (!flushed) {
+      logDebug("assistant final not written", {
+        msgId: meta.msgId,
+        hasText: Boolean(String(assistantText || "").trim()),
+        hasActiveUser: Boolean(activeTurnUserText),
+      });
+    }
   }
 
   async function handleEvent(payload) {
@@ -167,9 +417,11 @@ export const ContextFSPlugin = async ({ directory }) => {
       const msgId =
         part.messageID ||
         part.messageId ||
+        part.message_id ||
         part.id ||
         delta?.messageID ||
         delta?.messageId ||
+        delta?.message_id ||
         null;
 
       const deltaText = extractDeltaText(delta);
@@ -210,46 +462,16 @@ export const ContextFSPlugin = async ({ directory }) => {
       return;
     }
 
+    if (type === "tui.prompt.append") {
+      const promptText = extractPromptInputText(payload) || String(props.text || "").trim();
+      if (promptText) {
+        beginTurnWithUserText(promptText, "event:tui.prompt.append");
+      }
+      return;
+    }
+
     if (type === "message.updated") {
-      const info = props.info || props.message?.info || props;
-      const msgId = getMsgIdFromInfo(info);
-      const role = info?.role || "unknown";
-      const finished = info?.finish === "stop" || Boolean(info?.time?.completed);
-
-      if (finished && msgId && streamBuf.has(msgId)) {
-        const buf = streamBuf.get(msgId);
-        streamBuf.delete(msgId);
-
-        const text = String(buf?.text || "").trim();
-        if (!text) {
-          logDebug("message.updated flush EMPTY", { msgId, role });
-          return;
-        }
-
-        await recordTurn(storage, role, text);
-        await addPinsFromText(storage, text, config);
-        await autoCompactIfNeeded();
-        await storage.refreshManifest();
-        return;
-      }
-
-      // Fallback: some user messages only provide summary.title
-      const title = info?.summary?.title;
-      if (role === "user" && title) {
-        const fallback = `[user-summary] ${title}`;
-        await recordTurn(storage, "user", fallback);
-        await autoCompactIfNeeded();
-        await storage.refreshManifest();
-        return;
-      }
-
-      logDebug("message.updated no-text", {
-        msgId,
-        role,
-        finished,
-        infoKeys: info ? Object.keys(info) : [],
-        sample: JSON.stringify(info).slice(0, 800),
-      });
+      await handleMessageUpdated(payload);
       return;
     }
 
@@ -264,6 +486,16 @@ export const ContextFSPlugin = async ({ directory }) => {
 
   return {
     event: async (payload) => safeRun(workspaceDir, debugEnabled, "event", async () => handleEvent(payload)),
+    "chat.message": async (input, output) =>
+      safeRun(workspaceDir, debugEnabled, "chat.message", async () => {
+        const userText =
+          extractPromptInputText(output) ||
+          extractPromptInputText(input) ||
+          extractUserTextFromParts(output?.parts);
+        if (userText) {
+          beginTurnWithUserText(userText, "chat.message");
+        }
+      }),
     "session.created": async () =>
       safeRun(workspaceDir, debugEnabled, "session.created", async () => {
         await storage.ensureInitialized();
@@ -271,30 +503,23 @@ export const ContextFSPlugin = async ({ directory }) => {
       }),
     "message.updated": async (input) =>
       safeRun(workspaceDir, debugEnabled, "message.updated", async () => {
-        const evt = input?.event || input || {};
-        const props = evt.properties || evt.props || input?.properties || {};
-        const msg = props.message || props.msg || props.data || (evt.type ? props : evt);
-        const role = roleFromMessage(msg, "message");
-        const text = textFromMessage(msg);
-        await recordTurn(storage, role, text);
-        await addPinsFromText(storage, text, config);
-        await autoCompactIfNeeded();
-        await storage.refreshManifest();
+        await handleMessageUpdated(input);
       }),
     "tool.execute.after": async (input, output) =>
       safeRun(workspaceDir, debugEnabled, "tool.execute.after", async () => {
         const commandText = textFromMessage(input?.args || input);
         const resultText = textFromMessage(output);
-        const merged = [commandText, resultText].filter(Boolean).join("\n");
-        if (merged) {
-          await recordTurn(storage, "tool", merged);
-          await addPinsFromText(storage, merged, config);
-        }
-        await autoCompactIfNeeded();
-        await storage.refreshManifest();
+        logDebug("tool.execute.after ignored for history", {
+          commandLen: commandText.length,
+          resultLen: resultText.length,
+        });
       }),
-    "tui.prompt.append": async (_input, output) =>
+    "tui.prompt.append": async (input, output) =>
       safeRun(workspaceDir, debugEnabled, "tui.prompt.append", async () => {
+        const userText = extractPromptInputText(input);
+        if (userText) {
+          beginTurnWithUserText(userText, "tui.prompt.append");
+        }
         if (!config.autoInject) {
           return;
         }
