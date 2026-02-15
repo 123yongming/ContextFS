@@ -16,6 +16,7 @@ Small, non-invasive OpenCode plugin to keep long sessions stable.
   - PINS (max 20 items)
   - SUMMARY (max 3200 chars)
   - MANIFEST (max 20 lines)
+  - RETRIEVAL_INDEX (max 8 items; derived from last search)
   - WORKSET (recent 6 turns)
 
 - **Auto Compaction**: Triggers when tokens > threshold (default 8000)
@@ -29,8 +30,8 @@ Small, non-invasive OpenCode plugin to keep long sessions stable.
 
 ```bash
 mkdir -p .opencode/plugins
-cp plugins/contextfs/contextfs.plugin.mjs .opencode/plugins/
-cp -r plugins/contextfs .opencode/plugins/
+cp <path-to-contextfs>/.opencode/plugins/contextfs.plugin.mjs .opencode/plugins/
+cp -r <path-to-contextfs>/.opencode/plugins/contextfs .opencode/plugins/
 ```
 
 Restart OpenCode session.
@@ -87,7 +88,8 @@ Sections (fixed order):
 1. PINS
 2. SUMMARY
 3. MANIFEST
-4. WORKSET_RECENT_TURNS
+4. RETRIEVAL_INDEX
+5. WORKSET_RECENT_TURNS
 
 ## Testing
 

@@ -90,6 +90,19 @@ test("mergeConfig clamps invalid values and normalizes booleans", () => {
   assert.ok(huge.packDelimiterEnd.length <= 128);
 });
 
+test("CONTEXT_LAYERS.md documents stable L0/L1/L2 contracts", async () => {
+  const docUrl = new URL("../../../../CONTEXT_LAYERS.md", import.meta.url);
+  const raw = await fs.readFile(docUrl, "utf8");
+  assert.ok(raw.includes("L0"));
+  assert.ok(raw.includes("L1"));
+  assert.ok(raw.includes("L2"));
+  assert.ok(raw.includes("L0 Row Schema"));
+  assert.ok(raw.includes("Pack Section Order"));
+  assert.ok(raw.includes("RETRIEVAL_INDEX"));
+  assert.ok(raw.includes("ctx search --json"));
+  assert.ok(raw.includes("ctx get --json"));
+});
+
 async function withTempStorage(run) {
   const workspaceDir = await fs.mkdtemp(path.join(os.tmpdir(), "contextfs-test-"));
   const config = mergeConfig({ contextfsDir: ".contextfs" });
