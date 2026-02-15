@@ -24,8 +24,8 @@ test("estimateTokens is stable and monotonic", () => {
 
 test("estimateTokens handles mixed ascii/cjk text with monotonic growth", () => {
   const ascii = estimateTokens("hello world");
-  const cjk = estimateTokens("你好世界");
-  const mixed = estimateTokens("hello 你好 world 世界");
+  const cjk = estimateTokens("\u4f60\u597d\u4e16\u754c");
+  const mixed = estimateTokens(`hello ${"\u4f60\u597d"} world ${"\u4e16\u754c"}`);
   assert.ok(ascii > 0);
   assert.ok(cjk > 0);
   assert.ok(mixed >= ascii);
@@ -33,14 +33,14 @@ test("estimateTokens handles mixed ascii/cjk text with monotonic growth", () => 
 
 test("dedupePins removes exact and prefix-like duplicates", () => {
   const pins = [
-    { text: "必须不改 OpenCode 核心架构" },
-    { text: "必须不改 OpenCode 核心架构" },
-    { text: "必须不改 OpenCode 核心架构和协议" },
-    { text: "不要引入向量数据库" },
+    { text: "must not change OpenCode core architecture" },
+    { text: "must not change OpenCode core architecture" },
+    { text: "must not change OpenCode core architecture and contract" },
+    { text: "do not introduce vector database" },
   ];
   const out = dedupePins(pins, 20);
   assert.ok(out.length <= 3);
-  assert.ok(out.some((x) => x.text.includes("向量数据库")));
+  assert.ok(out.some((x) => x.text.includes("vector database")));
 });
 
 test("mergeSummary appends incrementally and stays bounded", () => {
@@ -436,23 +436,23 @@ test("archive search finds semantically close cjk phrasing among many unrelated 
     };
     await storage.appendHistory({
       role: "user",
-      text: "王俊凯喜欢易烊千玺",
+      text: "\u738b\u4fca\u51ef\u559c\u6b22\u6613\u70ca\u5343\u73ba",
       ts: "2026-02-11T03:00:00.000Z",
     });
     for (let i = 1; i <= 30; i += 1) {
       await storage.appendHistory({
         role: i % 2 ? "assistant" : "user",
-        text: `其它无关记录-${i}`,
+        text: `unrelated-row-${i}`,
         ts: `2026-02-11T03:01:${String(i).padStart(2, "0")}.000Z`,
       });
     }
     await maybeCompact(storage, localConfig, true);
 
-    const out = await runCtxCommand('ctx search "王俊凯喜欢谁" --scope archive --k 5 --json', storage, localConfig);
+    const out = await runCtxCommand('ctx search "\u738b\u4fca\u51ef\u559c\u6b22\u8c01" --scope archive --k 5 --json', storage, localConfig);
     assert.equal(out.ok, true);
     const parsed = JSON.parse(out.text);
     assert.ok(parsed.hits >= 1);
-    assert.ok(parsed.results.some((row) => String(row.summary || "").includes("王俊凯喜欢易烊千玺")));
+    assert.ok(parsed.results.some((row) => String(row.summary || "").includes("\u738b\u4fca\u51ef\u559c\u6b22\u6613\u70ca\u5343\u73ba")));
   });
 });
 
@@ -585,6 +585,75 @@ test("search and timeline outputs are bounded and do not dump full text", async 
   });
 });
 
+test("ctx search --json emits stable L0 row shape with bounded single-line summaries", async () => {
+  await withTempStorage(async ({ storage, config }) => {
+    const veryLong = `important-query ${"LONG".repeat(300)}`;
+    await storage.appendHistory({ role: "user", text: veryLong, ts: "2026-02-09T00:01:00.000Z" });
+
+    const out = await runCtxCommand('ctx search "important-query" --k 3 --json', storage, config);
+    assert.equal(out.ok, true);
+    const parsed = JSON.parse(out.text);
+    assert.equal(parsed.layer, "L0");
+    assert.ok(Array.isArray(parsed.results));
+    assert.ok(parsed.results.length >= 1);
+
+    for (const row of parsed.results) {
+      assert.equal(row.layer, "L0");
+      assert.equal(typeof row.id, "string");
+      assert.equal(typeof row.ts, "string");
+      assert.equal(typeof row.type, "string");
+      assert.equal(typeof row.summary, "string");
+      assert.equal(typeof row.source, "string");
+      assert.equal(row.summary.includes("\n"), false);
+      assert.ok(row.summary.length <= config.searchSummaryMaxChars + 3);
+
+      assert.ok(row.expand);
+      assert.equal(typeof row.expand, "object");
+      assert.ok(row.expand.timeline);
+      assert.ok(row.expand.get);
+      assert.equal(typeof row.expand.timeline.tokens_est, "number");
+      assert.equal(typeof row.expand.timeline.size, "string");
+      assert.equal(typeof row.expand.get.tokens_est, "number");
+      assert.equal(typeof row.expand.get.size, "string");
+    }
+  });
+});
+
+test("ctx timeline --json emits stable L0 row shape", async () => {
+  await withTempStorage(async ({ storage, config }) => {
+    for (let i = 1; i <= 5; i += 1) {
+      await storage.appendHistory({
+        role: i % 2 ? "user" : "assistant",
+        text: `timeline-json-row-${i} ${"Z".repeat(500)}`,
+        ts: `2026-02-09T00:02:0${i}.000Z`,
+      });
+    }
+    const history = await storage.readHistory();
+    const anchor = history[2];
+
+    const out = await runCtxCommand(`ctx timeline ${anchor.id} --before 1 --after 1 --json`, storage, config);
+    assert.equal(out.ok, true);
+    const parsed = JSON.parse(out.text);
+    assert.equal(parsed.layer, "L0");
+    assert.ok(Array.isArray(parsed.results));
+    assert.ok(parsed.results.length >= 1);
+    assert.ok(parsed.results.every((row) => row.layer === "L0"));
+    assert.ok(parsed.results.every((row) => typeof row.summary === "string" && !row.summary.includes("\n")));
+    assert.ok(parsed.results.every((row) => row.summary.length <= config.searchSummaryMaxChars + 3));
+  });
+});
+
+test("buildContextPack workset recent turns are structured and bounded (L1 preview)", async () => {
+  await withTempStorage(async ({ storage, config }) => {
+    const long = `workset-preview ${"Q".repeat(3000)}`;
+    await storage.appendHistory({ role: "user", text: long, ts: "2026-02-09T00:00:00.000Z" });
+    const pack = await buildContextPack(storage, config);
+    assert.ok(pack.block.includes("### WORKSET_RECENT_TURNS"));
+    assert.ok(pack.block.includes("| user |"));
+    assert.equal(pack.block.includes("Q".repeat(400)), false);
+  });
+});
+
 test("timeline window returns exact before/after neighborhood", async () => {
   await withTempStorage(async ({ storage, config }) => {
     for (let i = 1; i <= 7; i += 1) {
@@ -663,6 +732,31 @@ test("ctx stats exposes retrieval and pack observability fields", async () => {
     assert.ok(stats.text.includes("compact_count"));
     assert.ok(stats.text.includes("last_search_hits"));
     assert.ok(stats.text.includes("workset_used"));
+  });
+});
+
+test("ctx stats --json includes pack_breakdown with section token estimates", async () => {
+  await withTempStorage(async ({ storage, config }) => {
+    await storage.appendHistory({ role: "user", text: "stats breakdown row", ts: "2026-02-09T00:04:00.000Z" });
+    const out = await runCtxCommand("ctx stats --json", storage, config);
+    assert.equal(out.ok, true);
+    const parsed = JSON.parse(out.text);
+    assert.ok(parsed.pack_breakdown);
+    const b = parsed.pack_breakdown;
+    for (const key of [
+      "pins_tokens",
+      "summary_tokens",
+      "manifest_tokens",
+      "retrieval_index_tokens",
+      "workset_recent_turns_tokens",
+      "overhead_tokens",
+      "total_tokens",
+    ]) {
+      assert.equal(typeof b[key], "number");
+      assert.ok(Number.isFinite(b[key]));
+      assert.ok(b[key] >= 0);
+    }
+    assert.equal(b.total_tokens, parsed.estimated_tokens);
   });
 });
 
