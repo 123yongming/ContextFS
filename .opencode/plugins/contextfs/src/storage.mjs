@@ -136,6 +136,16 @@ function extractRefs(text) {
   return uniqList(refs, 10);
 }
 
+function normalizeSessionId(value) {
+  const clean = safeTrim(value);
+  if (!clean) {
+    return undefined;
+  }
+  // Keep session ids small/stable; avoid bloating history/index rows.
+  const maxLen = 96;
+  return clean.length <= maxLen ? clean : clean.slice(0, maxLen);
+}
+
 function normalizeEntry(raw, fallbackTs = stableFallbackTs(0)) {
   const src = raw && typeof raw === "object" ? raw : {};
   const role = normalizeRole(src.role || src.author || src.messageRole);
@@ -144,6 +154,7 @@ function normalizeEntry(raw, fallbackTs = stableFallbackTs(0)) {
   const refs = uniqList(Array.isArray(src.refs) ? src.refs : extractRefs(text), 12);
   const tags = Array.isArray(src.tags) ? uniqList(src.tags, 12) : undefined;
   const type = safeTrim(src.type) || inferType(role, text);
+  const session_id = normalizeSessionId(src.session_id ?? src.sessionId ?? src.session);
   const idSeed = `${ts}|${role}|${text}`;
   const id = safeTrim(src.id) || `H-${shortHash(idSeed)}`;
   const base = {
@@ -156,6 +167,9 @@ function normalizeEntry(raw, fallbackTs = stableFallbackTs(0)) {
   };
   if (tags && tags.length) {
     base.tags = tags;
+  }
+  if (session_id) {
+    base.session_id = session_id;
   }
   return base;
 }
@@ -205,6 +219,7 @@ function toArchiveIndexEntry(entry, archivedAt) {
     id: String(entry.id || ""),
     ts: normalizeTs(entry.ts, stableFallbackTs(0)),
     type: safeTrim(entry.type) || "note",
+    session_id: normalizeSessionId(entry.session_id ?? entry.sessionId ?? entry.session),
     refs: uniqList(Array.isArray(entry.refs) ? entry.refs : [], 12),
     summary: summarizeText(entry.text, 240),
     archivedAt: normalizeTs(archivedAt, nowIso()),
@@ -231,6 +246,7 @@ function parseArchiveIndexText(rawText) {
         id,
         ts: normalizeTs(parsed.ts, stableFallbackTs(idx)),
         type: safeTrim(parsed.type) || "note",
+        session_id: normalizeSessionId(parsed.session_id ?? parsed.sessionId ?? parsed.session),
         refs: uniqList(Array.isArray(parsed.refs) ? parsed.refs : [], 12),
         summary: summarizeText(parsed.summary ?? parsed.text ?? "", 240),
         archivedAt: normalizeTs(parsed.archivedAt, stableFallbackTs(idx)),
@@ -396,10 +412,9 @@ export class ContextFsStorage {
             await fs.stat(this.lockPath);
             shouldRetry = true;
           } catch (statErr) {
-            if (statErr?.code === "ENOENT") {
-              throw err;
-            }
-            shouldRetry = false;
+            // On Windows, antivirus/indexers can cause transient EPERM/EACCES
+            // even when the lock file does not exist yet. Treat as retryable.
+            shouldRetry = statErr?.code === "ENOENT";
           }
         }
         if (!shouldRetry) {
@@ -841,6 +856,9 @@ export class ContextFsStorage {
       revision: 0,
       createdAt: nowIso(),
       updatedAt: nowIso(),
+      currentSessionId: null,
+      sessionCount: 0,
+      lastSessionCreatedAt: null,
       lastCompactedAt: null,
       compactCount: 0,
       lastPackTokens: 0,

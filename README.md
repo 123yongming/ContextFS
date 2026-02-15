@@ -1,4 +1,4 @@
-﻿# ContextFS
+# ContextFS
 
 ContextFS 是一个给 OpenCode 用的轻量上下文管理插件，目标很简单：
 让长对话不跑偏、可追溯、可检索。
@@ -45,16 +45,15 @@ cp -r <path-to-contextfs>/.opencode/plugins/contextfs .opencode/plugins/
 
 ## 最常用用法（对话框）
 
-在 OpenCode 对话框直接输入：
-
-```text
-/ctx search "lock timeout" --k 5 --scope all
-/ctx timeline H-abc12345 --before 3 --after 3
-/ctx get H-abc12345 --head 1200
+/ctx ls                           # 查看状态
+/ctx stats                        # 查看统计
+/ctx search "关键词" --k 5 --session current
+/ctx timeline H-xxx --before 3 --after 3 --session current
+/ctx get H-xxx --head 1200 --session current
 /ctx stats --json
 /ctx pin "不要修改核心架构"
-/ctx compact
-```
+/ctx compact                     # 手动触发压缩
+/ctx gc                          # 清理重复 ID
 
 如果只是日常使用，优先使用 `/ctx ...`，不需要手动执行 Node 命令。
 
@@ -81,10 +80,11 @@ ContextFS 把“检索与注入”分成三层，核心目的是省 token 且可
 
 ### 输出与字段（对齐当前分支）
 
-- `ctx search` 支持 `--scope all|hot|archive` 控制检索范围；`search/timeline/get/stats` 支持 `--json` 输出结构化结果。
-- `ctx search --json` / `ctx timeline --json`：返回 `layer: "L0"`，每条结果是稳定的 L0 行（`id/ts/type/summary/source/layer`），并可能包含 `score`、`expand`（提示展开 `timeline/get` 的默认窗口与粗略 token 量级）。
+- `ctx search` 支持 `--scope all|hot|archive` 控制检索范围；支持 `--session all|current|<session-id>` 做会话隔离（默认 `all`，检索所有会话；用 `current` 仅查当前 OpenCode 会话；用具体 ID 查特定会话）。
+- `search/timeline/get/stats` 支持 `--json` 输出结构化结果。
+- `ctx search --json` / `ctx timeline --json`：返回 `layer: "L0"`，每条结果是稳定的 L0 行（`id/ts/type/summary/source/layer`），并可能包含 `score`、`expand`（提示展开 `timeline/get` 的默认窗口与粗略 token 量级）。顶层会附带 `session` 字段用于调试。
 - `ctx get --json`：返回 `layer: "L2"`，包含 `record`（完整记录，默认按 `--head` 做裁剪）与 `source`（hot|archive）。
-- `ctx stats`：文本输出会额外打印 `pack_breakdown_tokens(est)`；`--json` 会包含 `pack_breakdown`（各 section 的 token 估算）。
+- `ctx stats`：文本输出会额外打印 `pack_breakdown_tokens(est)`；`--json` 会包含 `pack_breakdown`（各 section 的 token 估算）与 `session_id`。
 
 ## 目录说明（用户视角）
 

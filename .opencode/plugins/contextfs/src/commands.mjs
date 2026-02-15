@@ -36,6 +36,11 @@ function getFlagValue(args, flag, fallback) {
   return args[idx + 1] ?? fallback;
 }
 
+function isMissingFlagValue(value) {
+  const text = String(value ?? "").trim();
+  return !text || text.startsWith("--");
+}
+
 function stripFlags(args, flagsWithValue = []) {
   const valueFlags = new Set(flagsWithValue);
   const out = [];
@@ -51,6 +56,33 @@ function stripFlags(args, flagsWithValue = []) {
     out.push(part);
   }
   return out;
+}
+
+async function getSessionFilter(args, storage, usage) {
+  const idx = args.indexOf("--session");
+  if (idx < 0) {
+    return { mode: "all", sessionId: null };
+  }
+  const raw = args[idx + 1];
+  if (isMissingFlagValue(raw)) {
+    return { error: `usage: ${usage}` };
+  }
+  const value = String(raw).trim();
+  const lower = value.toLowerCase();
+  if (lower === "all") {
+    return { mode: "all", sessionId: null };
+  }
+  if (lower === "current") {
+    const state = await storage.readState();
+    const current = String(state.currentSessionId || "").trim();
+    if (!current) {
+      return {
+        error: "no current session id in state. run the plugin once (or omit --session) to initialize a session.",
+      };
+    }
+    return { mode: "id", sessionId: current };
+  }
+  return { mode: "id", sessionId: value };
 }
 
 function lineSummary(text, maxChars) {
@@ -263,6 +295,7 @@ function asArchiveSearchRows(items) {
     id: item.id,
     ts: item.ts,
     type: item.type || "note",
+    session_id: item.session_id,
     refs: Array.isArray(item.refs) ? item.refs : [],
     text: String(item.summary || item.text || ""),
     source: "archive",
@@ -328,9 +361,9 @@ export async function runCtxCommand(commandLine, storage, config) {
         "  ctx cat <file> [--head 30]",
         "  ctx pin \"<text>\"",
         "  ctx compact",
-        "  ctx search \"<query>\" [--k 5] [--scope all|hot|archive]",
-        "  ctx timeline <id> [--before 3 --after 3]",
-        "  ctx get <id> [--head 1200]",
+        "  ctx search \"<query>\" [--k 5] [--scope all|hot|archive] [--session all|current|<id>]",
+        "  ctx timeline <id> [--before 3 --after 3] [--session all|current|<id>]",
+        "  ctx get <id> [--head 1200] [--session all|current|<id>]",
         "  ctx stats",
         "  ctx gc",
         "  ctx reindex",
@@ -352,6 +385,7 @@ export async function runCtxCommand(commandLine, storage, config) {
       ...manifest.split("\n").slice(0, 8),
       "",
       "## overview",
+      `- session_id: ${state.currentSessionId || "none"}`,
       `- pins.count: ${pinsCount}`,
       `- summary.chars: ${summary.length}`,
       `- pack.tokens(est): ${pack.details.estimatedTokens}`,
@@ -373,6 +407,7 @@ export async function runCtxCommand(commandLine, storage, config) {
     const payload = {
       estimated_tokens: pack.details.estimatedTokens,
       threshold: config.tokenThreshold,
+      session_id: state.currentSessionId || null,
       compact_count: state.compactCount || 0,
       last_search_hits: state.lastSearchHits || 0,
       workset_used: pack.details.worksetUsed ?? pack.details.recentTurns,
@@ -391,6 +426,7 @@ export async function runCtxCommand(commandLine, storage, config) {
         "# ctx stats",
         `estimated_tokens: ${payload.estimated_tokens}`,
         `threshold: ${payload.threshold}`,
+        `session_id: ${payload.session_id || "none"}`,
         `compact_count: ${payload.compact_count}`,
         `last_search_hits: ${payload.last_search_hits}`,
         `workset_used: ${payload.workset_used}`,
@@ -451,19 +487,27 @@ export async function runCtxCommand(commandLine, storage, config) {
 
   if (cmd === "search") {
     const asJson = hasFlag(args, "--json");
-    const cleanArgs = stripFlags(args, ["--k"]);
+    const session = await getSessionFilter(args, storage, 'ctx search "<query>" [--k 5] [--scope all|hot|archive] [--session all|current|<id>]');
+    if (session.error) {
+      return errorResult(session.error);
+    }
+    const cleanArgs = stripFlags(args, ["--k", "--session"]);
     const k = clampInt(toInt(getFlagValue(args, "--k", config.searchDefaultK), config.searchDefaultK), 1, 50);
     const scope = String(getFlagValue(args, "--scope", "all") || "all").toLowerCase();
     const query = stripFlags(cleanArgs, ["--scope"]).join(" ").trim();
     if (!query) {
-      return errorResult('usage: ctx search "<query>" [--k 5]');
+      return errorResult('usage: ctx search "<query>" [--k 5] [--scope all|hot|archive] [--session all|current|<id>]');
     }
     const queryTokens = tokenize(query);
     const { history, archive } = await readHistoryByScope(storage, scope);
     const pool = mergeUniqueHistory(history, archive);
     const hotIds = new Set(history.map((item) => String(item.id)));
-    const newestTs = pool.length ? Date.parse(String(pool[pool.length - 1].ts || "")) : Date.now();
-    const ranked = pool
+    const sessionPool =
+      session.mode === "all"
+        ? pool
+        : pool.filter((item) => String(item?.session_id || "") === String(session.sessionId || ""));
+    const newestTs = sessionPool.length ? Date.parse(String(sessionPool[sessionPool.length - 1].ts || "")) : Date.now();
+    const ranked = sessionPool
       .map((entry) => ({
         entry,
         score: scoreEntry(entry, queryTokens, newestTs),
@@ -515,11 +559,19 @@ export async function runCtxCommand(commandLine, storage, config) {
     }));
 
     if (asJson) {
-      return textResult(JSON.stringify({ layer: "L0", query, k, scope, hits: rows.length, results: rows }, null, 2));
+      return textResult(JSON.stringify({
+        layer: "L0",
+        query,
+        k,
+        scope,
+        session: session.mode === "all" ? "all" : session.sessionId,
+        hits: rows.length,
+        results: rows,
+      }, null, 2));
     }
 
     const lines = [
-      `# search (${rows.length} hits, scope=${scope})`,
+      `# search (${rows.length} hits, scope=${scope}, session=${session.mode === "all" ? "all" : session.sessionId})`,
       "",
       ...rows.map((x) => `${x.id} | ${x.ts} | ${x.type} | ${x.source} | ${x.summary}`),
     ];
@@ -528,10 +580,14 @@ export async function runCtxCommand(commandLine, storage, config) {
 
   if (cmd === "timeline") {
     const asJson = hasFlag(args, "--json");
-    const cleanArgs = stripFlags(args, ["--before", "--after"]);
+    const session = await getSessionFilter(args, storage, "ctx timeline <id> [--before 3 --after 3] [--session all|current|<id>]");
+    if (session.error) {
+      return errorResult(session.error);
+    }
+    const cleanArgs = stripFlags(args, ["--before", "--after", "--session"]);
     const anchorId = cleanArgs[0];
     if (!anchorId) {
-      return errorResult("usage: ctx timeline <id> [--before 3 --after 3]");
+      return errorResult("usage: ctx timeline <id> [--before 3 --after 3] [--session all|current|<id>]");
     }
     const before = clampInt(
       toInt(getFlagValue(args, "--before", config.timelineBeforeDefault), config.timelineBeforeDefault),
@@ -548,14 +604,26 @@ export async function runCtxCommand(commandLine, storage, config) {
     const hotMatches = findIdMatches(history, anchorId);
     const archiveMatches = findIdMatches(archive, anchorId);
     const sourceList = hotMatches.length ? history : archive;
-    const matches = hotMatches.length ? hotMatches : archiveMatches;
+    let matches = hotMatches.length ? hotMatches : archiveMatches;
     if (!matches.length) {
       return errorResult(`id not found: ${anchorId}`);
     }
     if (matches.length > 1) {
-      return errorResult(`id conflict: ${anchorId}. run ctx gc or migration to repair duplicate ids`);
+      if (session.mode !== "all") {
+        const filtered = matches.filter((item) => String(item?.session_id || "") === String(session.sessionId || ""));
+        if (filtered.length === 1) {
+          matches = filtered;
+        } else if (!filtered.length) {
+          return errorResult(`id conflict: ${anchorId} (no match for session ${session.sessionId}). run ctx gc or migration to repair duplicate ids`);
+        } else {
+          return errorResult(`id conflict: ${anchorId} (multiple matches in session ${session.sessionId}). run ctx gc or migration to repair duplicate ids`);
+        }
+      } else {
+        return errorResult(`id conflict: ${anchorId}. run ctx gc or migration to repair duplicate ids`);
+      }
     }
-    const index = sourceList.findIndex((item) => String(item.id) === String(anchorId));
+    const resolvedId = matches[0].id;
+    const index = sourceList.findIndex((item) => String(item.id) === String(resolvedId));
     const start = Math.max(0, index - before);
     const end = Math.min(sourceList.length, index + after + 1);
     const sliceSource = hotMatches.length ? "hot" : "archive";
@@ -563,14 +631,22 @@ export async function runCtxCommand(commandLine, storage, config) {
 
     await storage.updateState((cur) => ({
       timelineCount: (cur.timelineCount || 0) + 1,
-      lastTimelineAnchor: anchorId,
+      lastTimelineAnchor: resolvedId,
     }));
 
     if (asJson) {
-      return textResult(JSON.stringify({ layer: "L0", anchor: anchorId, before, after, source: sliceSource, results: slice }, null, 2));
+      return textResult(JSON.stringify({
+        layer: "L0",
+        anchor: resolvedId,
+        before,
+        after,
+        source: sliceSource,
+        session: session.mode === "all" ? "all" : session.sessionId,
+        results: slice,
+      }, null, 2));
     }
     const lines = [
-      `# timeline ${anchorId}`,
+      `# timeline ${resolvedId} (session=${session.mode === "all" ? "all" : session.sessionId})`,
       "",
       ...slice.map((x) => `${x.id} | ${x.ts} | ${x.type} | ${x.source} | ${x.summary}`),
     ];
@@ -579,21 +655,36 @@ export async function runCtxCommand(commandLine, storage, config) {
 
   if (cmd === "get") {
     const asJson = hasFlag(args, "--json");
-    const cleanArgs = stripFlags(args, ["--head"]);
+    const session = await getSessionFilter(args, storage, "ctx get <id> [--head 1200] [--session all|current|<id>]");
+    if (session.error) {
+      return errorResult(session.error);
+    }
+    const cleanArgs = stripFlags(args, ["--head", "--session"]);
     const id = cleanArgs[0];
     if (!id) {
-      return errorResult("usage: ctx get <id> [--head 1200]");
+      return errorResult("usage: ctx get <id> [--head 1200] [--session all|current|<id>]");
     }
     const head = clampInt(toInt(getFlagValue(args, "--head", config.getDefaultHead), config.getDefaultHead), 0, 200000);
     const history = await storage.readHistory();
     const hotMatches = findIdMatches(history, id);
     const archiveRow = await storage.findHistoryArchiveById(id);
-    const matches = hotMatches.length ? hotMatches : (archiveRow ? [archiveRow] : []);
+    let matches = hotMatches.length ? hotMatches : (archiveRow ? [archiveRow] : []);
     if (!matches.length) {
       return errorResult(`id not found: ${id}`);
     }
     if (matches.length > 1) {
-      return errorResult(`id conflict: ${id}. run ctx gc or migration to repair duplicate ids`);
+      if (session.mode !== "all") {
+        const filtered = matches.filter((item) => String(item?.session_id || "") === String(session.sessionId || ""));
+        if (filtered.length === 1) {
+          matches = filtered;
+        } else if (!filtered.length) {
+          return errorResult(`id conflict: ${id} (no match for session ${session.sessionId}). run ctx gc or migration to repair duplicate ids`);
+        } else {
+          return errorResult(`id conflict: ${id} (multiple matches in session ${session.sessionId}). run ctx gc or migration to repair duplicate ids`);
+        }
+      } else {
+        return errorResult(`id conflict: ${id}. run ctx gc or migration to repair duplicate ids`);
+      }
     }
     const row = matches[0];
     const source = hotMatches.length ? "hot" : "archive";
