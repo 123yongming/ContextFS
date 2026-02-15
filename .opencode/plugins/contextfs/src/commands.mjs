@@ -2,6 +2,7 @@ import { fileMap } from "./storage.mjs";
 import { addPin, parsePinsMarkdown } from "./pins.mjs";
 import { maybeCompact } from "./compactor.mjs";
 import { buildContextPack } from "./packer.mjs";
+import { estimateTokens } from "./token.mjs";
 
 function parseArgs(raw) {
   const input = String(raw || "").trim();
@@ -58,6 +59,30 @@ function lineSummary(text, maxChars) {
     return oneLine;
   }
   return `${oneLine.slice(0, Math.max(0, maxChars - 3))}...`;
+}
+
+function sizeBucket(tokens) {
+  const n = Number(tokens);
+  const safe = Number.isFinite(n) ? n : 0;
+  if (safe <= 220) return "small";
+  if (safe <= 520) return "medium";
+  return "large";
+}
+
+function toL0Row(entry, config, source, extras = {}) {
+  const e = entry && typeof entry === "object" ? entry : {};
+  const row = {
+    id: String(e.id || ""),
+    ts: isoMaybe(e.ts),
+    type: String(e.type || "note"),
+    summary: lineSummary(e.text, config.searchSummaryMaxChars),
+    source: String(source || "hot"),
+    layer: "L0",
+    ...extras,
+  };
+  // Guarantee a bounded, single-line summary even if callers pass a bad entry.
+  row.summary = lineSummary(row.summary, config.searchSummaryMaxChars);
+  return row;
 }
 
 function tokenize(text) {
@@ -344,6 +369,7 @@ export async function runCtxCommand(commandLine, storage, config) {
       statsCount: (cur.statsCount || 0) + 1,
     }));
     const pack = await buildContextPack(storage, config);
+    const breakdown = pack.details.packBreakdown || {};
     const payload = {
       estimated_tokens: pack.details.estimatedTokens,
       threshold: config.tokenThreshold,
@@ -354,6 +380,7 @@ export async function runCtxCommand(commandLine, storage, config) {
       timeline_count: state.timelineCount || 0,
       get_count: state.getCount || 0,
       stats_count: state.statsCount || 0,
+      pack_breakdown: breakdown,
     };
     const jsonOut = jsonOrText(payload, hasFlag(args, "--json"));
     if (jsonOut) {
@@ -367,6 +394,16 @@ export async function runCtxCommand(commandLine, storage, config) {
         `compact_count: ${payload.compact_count}`,
         `last_search_hits: ${payload.last_search_hits}`,
         `workset_used: ${payload.workset_used}`,
+        "",
+        "pack_breakdown_tokens(est):",
+        `pins: ${Number(breakdown.pins_tokens ?? 0)}`,
+        `summary: ${Number(breakdown.summary_tokens ?? 0)}`,
+        `manifest: ${Number(breakdown.manifest_tokens ?? 0)}`,
+        `retrieval_index: ${Number(breakdown.retrieval_index_tokens ?? 0)}`,
+        `workset_recent_turns: ${Number(breakdown.workset_recent_turns_tokens ?? 0)}`,
+        `overhead: ${Number(breakdown.overhead_tokens ?? 0)}`,
+        `total: ${Number(breakdown.total_tokens ?? payload.estimated_tokens ?? 0)}`,
+        "",
         `search_count: ${payload.search_count}`,
         `timeline_count: ${payload.timeline_count}`,
         `get_count: ${payload.get_count}`,
@@ -436,12 +473,37 @@ export async function runCtxCommand(commandLine, storage, config) {
       .slice(0, k);
 
     const rows = ranked.map(({ entry, score }) => ({
-      id: entry.id,
-      ts: isoMaybe(entry.ts),
-      type: entry.type || "note",
-      summary: lineSummary(entry.text, config.searchSummaryMaxChars),
-      source: hotIds.has(String(entry.id)) ? "hot" : "archive",
-      score: Number(score.toFixed(3)),
+      ...(() => {
+        const source = hotIds.has(String(entry.id)) ? "hot" : "archive";
+        const row = toL0Row(entry, config, source, { score: Number(score.toFixed(3)) });
+
+        const beforeDefault = config.timelineBeforeDefault;
+        const afterDefault = config.timelineAfterDefault;
+        const window = beforeDefault + afterDefault + 1;
+        const timelineTokensEst = estimateTokens(row.summary) * Math.max(1, window);
+
+        const headDefault = config.getDefaultHead;
+        const entryText = String(entry?.text || "");
+        const getPreview = headDefault > 0 ? entryText.slice(0, headDefault) : entryText;
+        const getTokensEst = estimateTokens(getPreview) + 80; // fixed overhead for JSON fields, ids, refs/tags, etc.
+
+        row.expand = {
+          timeline: {
+            before: beforeDefault,
+            after: afterDefault,
+            window,
+            tokens_est: timelineTokensEst,
+            size: sizeBucket(timelineTokensEst),
+          },
+          get: {
+            head: headDefault,
+            tokens_est: getTokensEst,
+            size: sizeBucket(getTokensEst),
+            confidence: source === "hot" ? "medium" : "low",
+          },
+        };
+        return row;
+      })(),
     }));
 
     await storage.updateState((cur) => ({
@@ -453,7 +515,7 @@ export async function runCtxCommand(commandLine, storage, config) {
     }));
 
     if (asJson) {
-      return textResult(JSON.stringify({ query, k, scope, hits: rows.length, results: rows }, null, 2));
+      return textResult(JSON.stringify({ layer: "L0", query, k, scope, hits: rows.length, results: rows }, null, 2));
     }
 
     const lines = [
@@ -496,13 +558,8 @@ export async function runCtxCommand(commandLine, storage, config) {
     const index = sourceList.findIndex((item) => String(item.id) === String(anchorId));
     const start = Math.max(0, index - before);
     const end = Math.min(sourceList.length, index + after + 1);
-    const slice = sourceList.slice(start, end).map((entry) => ({
-      id: entry.id,
-      ts: isoMaybe(entry.ts),
-      type: entry.type || "note",
-      summary: lineSummary(entry.text, config.searchSummaryMaxChars),
-      source: hotMatches.length ? "hot" : "archive",
-    }));
+    const sliceSource = hotMatches.length ? "hot" : "archive";
+    const slice = sourceList.slice(start, end).map((entry) => toL0Row(entry, config, sliceSource));
 
     await storage.updateState((cur) => ({
       timelineCount: (cur.timelineCount || 0) + 1,
@@ -510,7 +567,7 @@ export async function runCtxCommand(commandLine, storage, config) {
     }));
 
     if (asJson) {
-      return textResult(JSON.stringify({ anchor: anchorId, before, after, source: hotMatches.length ? "hot" : "archive", results: slice }, null, 2));
+      return textResult(JSON.stringify({ layer: "L0", anchor: anchorId, before, after, source: sliceSource, results: slice }, null, 2));
     }
     const lines = [
       `# timeline ${anchorId}`,
@@ -546,6 +603,7 @@ export async function runCtxCommand(commandLine, storage, config) {
     if (asJson) {
       const jsonBudget = head > 0 ? head : config.getDefaultHead;
       const base = {
+        layer: "L2",
         record: row,
         source,
         head: jsonBudget,

@@ -381,7 +381,7 @@ export class ContextFsStorage {
     }
   }
 
-  async acquireLock(maxRetries = 20) {
+  async acquireLock(maxRetries = 80) {
     const staleMs = Math.max(1000, Number(this.config.lockStaleMs || 30000));
     for (let i = 0; i <= maxRetries; i += 1) {
       const stamp = `${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2, 8)}`;

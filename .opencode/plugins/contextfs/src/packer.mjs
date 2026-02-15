@@ -36,11 +36,14 @@ function capChars(content, maxChars) {
 }
 
 function renderTurns(turns, config) {
+  // L1 navigation preview. Not a full replay: one line per turn, bounded.
   const rows = turns.map((turn, i) => {
+    const id = String(turn.id || "no-id");
     const role = String(turn.role || "unknown");
+    const type = String(turn.type || "note");
     const text = sanitizeForPack(String(turn.text || "").replace(/\s+/g, " ").trim(), config);
-    const bounded = text.length > 180 ? `${text.slice(0, 177)}...` : text;
-    return `${i + 1}. [${turn.id || "no-id"}] [${role}] ${bounded}`;
+    const bounded = text.length > 160 ? `${text.slice(0, 157)}...` : text;
+    return `${i + 1}. ${id} | ${role} | ${type} | ${bounded}`;
   });
   return rows.join("\n");
 }
@@ -54,11 +57,34 @@ function renderRetrievalIndex(rows, config) {
       const id = String(row.id || "no-id");
       const ts = String(row.ts || "n/a");
       const type = String(row.type || "note");
+      const source = String(row.source || "n/a");
       const summary = sanitizeForPack(String(row.summary || "").replace(/\s+/g, " ").trim(), config);
       const bounded = summary.length > config.searchSummaryMaxChars ? `${summary.slice(0, config.searchSummaryMaxChars - 3)}...` : summary;
-      return `${id} | ${ts} | ${type} | ${bounded}`;
+      return `${id} | ${ts} | ${type} | ${source} | ${bounded}`;
     })
     .join("\n");
+}
+
+function normalizeRetrievalRows(rows, config) {
+  const list = Array.isArray(rows) ? rows : [];
+  return list
+    .map((row) => {
+      const src = row && typeof row === "object" ? row : {};
+      const summaryRaw = String(src.summary ?? src.text ?? "");
+      const oneLine = summaryRaw.replace(/\s+/g, " ").trim();
+      const bounded = oneLine.length > config.searchSummaryMaxChars
+        ? `${oneLine.slice(0, Math.max(0, config.searchSummaryMaxChars - 3))}...`
+        : oneLine;
+      return {
+        id: String(src.id || ""),
+        ts: String(src.ts || ""),
+        type: String(src.type || "note"),
+        source: String(src.source || ""),
+        summary: bounded,
+        layer: String(src.layer || "L0"),
+      };
+    })
+    .filter((row) => row.id);
 }
 
 function makeBlock(parts, config) {
@@ -106,7 +132,7 @@ export async function buildContextPack(storage, config) {
   let workset = renderTurns(recentTurns, config);
 
   const searchIndexRaw = Array.isArray(state.lastSearchIndex) ? state.lastSearchIndex : [];
-  let retrievalRows = searchIndexRaw.slice(0, config.retrievalIndexMaxItems);
+  let retrievalRows = normalizeRetrievalRows(searchIndexRaw, config).slice(0, config.retrievalIndexMaxItems);
   let retrievalIndex = renderRetrievalIndex(retrievalRows, config);
 
   let block = makeBlock(
@@ -267,6 +293,19 @@ export async function buildContextPack(storage, config) {
   const pinsCountActual = (pins.match(/^- \[/gm) || []).length;
   const manifestLinesActual = manifest.split("\n").filter(Boolean).length;
 
+  const pinsTokens = estimateTokens(pins);
+  const summaryTokens = estimateTokens(summary);
+  const manifestTokens = estimateTokens(manifest);
+  const retrievalIndexTokens = estimateTokens(retrievalIndex);
+  const worksetRecentTurnsTokens = estimateTokens(workset);
+  const sumPartsTokens =
+    pinsTokens
+    + summaryTokens
+    + manifestTokens
+    + retrievalIndexTokens
+    + worksetRecentTurnsTokens;
+  const overheadTokens = Math.max(0, tokens - sumPartsTokens);
+
   const details = {
     pinsCount: pinsCountActual,
     summaryChars: summary.length,
@@ -277,6 +316,15 @@ export async function buildContextPack(storage, config) {
     minimalMode: usedMinimal,
     emergencyMode: usedEmergency,
     estimatedTokens: tokens,
+    packBreakdown: {
+      pins_tokens: pinsTokens,
+      summary_tokens: summaryTokens,
+      manifest_tokens: manifestTokens,
+      retrieval_index_tokens: retrievalIndexTokens,
+      workset_recent_turns_tokens: worksetRecentTurnsTokens,
+      overhead_tokens: overheadTokens,
+      total_tokens: tokens,
+    },
   };
 
   await storage.updateState({
