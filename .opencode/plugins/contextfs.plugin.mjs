@@ -1,3 +1,4 @@
+import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 
@@ -139,15 +140,21 @@ function setCommandOutput(output, result) {
   output.stdout = result.text;
 }
 
-async function recordTurn(storage, role, text) {
+function newSessionId() {
+  return `S-${crypto.randomUUID()}`;
+}
+
+async function recordTurn(storage, role, text, sessionId) {
   const clean = String(text || "").trim();
   if (!clean) {
     return null;
   }
+  const session_id = String(sessionId || "").trim();
   return storage.appendHistory({
     role: role || "unknown",
     text: clean,
     ts: new Date().toISOString(),
+    ...(session_id ? { session_id } : {}),
   });
 }
 
@@ -160,6 +167,55 @@ export const ContextFSPlugin = async ({ directory }) => {
 
   const storage = new ContextFsStorage(workspaceDir, config);
   await storage.ensureInitialized();
+
+  let activeSessionId = null;
+  let lastSessionRotateAtMs = 0;
+  async function ensureActiveSession(reason = "unknown") {
+    if (activeSessionId) {
+      return activeSessionId;
+    }
+    const state = await storage.readState();
+    const existing = String(state.currentSessionId || "").trim();
+    if (existing) {
+      activeSessionId = existing;
+      return activeSessionId;
+    }
+    const id = newSessionId();
+    const now = new Date().toISOString();
+    await storage.updateState((cur) => ({
+      currentSessionId: id,
+      sessionCount: (cur.sessionCount || 0) + 1,
+      lastSessionCreatedAt: now,
+    }));
+    activeSessionId = id;
+    logDebug("session.created (init)", { reason, session_id: id });
+    return activeSessionId;
+  }
+
+  async function rotateSession(reason = "unknown") {
+    // Some OpenCode versions may emit both a generic event and a named hook for
+    // `session.created`. Debounce to avoid double-rotating the session id.
+    if (String(reason).includes("session.created")) {
+      const nowMs = Date.now();
+      if (nowMs - lastSessionRotateAtMs < 2000) {
+        logDebug("session.created skipped (debounced)", { reason, session_id: activeSessionId || null });
+        return activeSessionId || ensureActiveSession("session.rotate.debounce");
+      }
+      lastSessionRotateAtMs = nowMs;
+    }
+    const id = newSessionId();
+    const now = new Date().toISOString();
+    await storage.updateState((cur) => ({
+      currentSessionId: id,
+      sessionCount: (cur.sessionCount || 0) + 1,
+      lastSessionCreatedAt: now,
+    }));
+    activeSessionId = id;
+    logDebug("session.created", { reason, session_id: id });
+    return activeSessionId;
+  }
+
+  await ensureActiveSession("plugin.init");
 
   // Buffer streaming deltas by message id to avoid writing every chunk
   const streamBuf = new Map(); // msgId -> { text, updatedAt }
@@ -326,6 +382,7 @@ export const ContextFSPlugin = async ({ directory }) => {
     if (!cleanAssistant) {
       return false;
     }
+    const sessionId = await ensureActiveSession("turn.upsert");
     if (!activeTurnUserText) {
       logDebug("assistant skipped without active user turn", {
         msgId,
@@ -341,15 +398,15 @@ export const ContextFSPlugin = async ({ directory }) => {
     }
 
     if (!activeTurnAssistantId) {
-      const userRow = await recordTurn(storage, "user", activeTurnUserText);
+      const userRow = await recordTurn(storage, "user", activeTurnUserText, sessionId);
       activeTurnUserId = userRow?.id || null;
-      const assistantRow = await recordTurn(storage, "assistant", cleanAssistant);
+      const assistantRow = await recordTurn(storage, "assistant", cleanAssistant, sessionId);
       activeTurnAssistantId = assistantRow?.id || null;
       await addPinsFromText(storage, activeTurnUserText, config);
     } else {
       const updated = await replaceHistoryEntryText(activeTurnAssistantId, "assistant", cleanAssistant);
       if (!updated) {
-        const assistantRow = await recordTurn(storage, "assistant", cleanAssistant);
+        const assistantRow = await recordTurn(storage, "assistant", cleanAssistant, sessionId);
         activeTurnAssistantId = assistantRow?.id || null;
       }
     }
@@ -448,6 +505,7 @@ export const ContextFSPlugin = async ({ directory }) => {
     logDebug("event", { type, propKeys: Object.keys(props || {}) });
 
     if (type === "session.created") {
+      await rotateSession("event:session.created");
       await storage.ensureInitialized();
       await storage.refreshManifest();
       return;
@@ -498,6 +556,7 @@ export const ContextFSPlugin = async ({ directory }) => {
       }),
     "session.created": async () =>
       safeRun(workspaceDir, debugEnabled, "session.created", async () => {
+        await rotateSession("hook:session.created");
         await storage.ensureInitialized();
         await storage.refreshManifest();
       }),

@@ -458,11 +458,14 @@ test("archive search finds semantically close cjk phrasing among many unrelated 
 
 test("appendHistory writes normalized retrieval schema fields", async () => {
   await withTempStorage(async ({ storage }) => {
-    await storage.appendHistory({
+    const created = await storage.appendHistory({
       role: "user",
       text: "open src/app.mjs and check https://example.com/issues/12 #42",
       ts: "2026-02-09T00:00:00.000Z",
+      sessionId: "S-test-session",
     });
+    assert.ok(created);
+    assert.equal(created.session_id, "S-test-session");
 
     const history = await storage.readHistory();
     assert.equal(history.length, 1);
@@ -473,6 +476,84 @@ test("appendHistory writes normalized retrieval schema fields", async () => {
     assert.ok(Array.isArray(row.refs));
     assert.ok(row.refs.length >= 1);
     assert.equal(typeof row.text, "string");
+    assert.equal(row.session_id, "S-test-session");
+  });
+});
+
+test("ctx search --session filters hot rows by session_id", async () => {
+  await withTempStorage(async ({ storage, config }) => {
+    await storage.appendHistory({ role: "user", text: "needle alpha", ts: "2026-02-12T00:00:00.000Z", session_id: "S-A" });
+    await storage.appendHistory({ role: "assistant", text: "needle beta", ts: "2026-02-12T00:00:01.000Z", session_id: "S-B" });
+    await storage.appendHistory({ role: "user", text: "unrelated", ts: "2026-02-12T00:00:02.000Z", session_id: "S-A" });
+
+    const all = await runCtxCommand('ctx search "needle" --k 10 --json', storage, config);
+    assert.equal(all.ok, true);
+    const allParsed = JSON.parse(all.text);
+    assert.ok(allParsed.hits >= 2);
+
+    const outA = await runCtxCommand('ctx search "needle" --k 10 --session S-A --json', storage, config);
+    assert.equal(outA.ok, true);
+    const parsedA = JSON.parse(outA.text);
+    assert.ok(parsedA.hits >= 1);
+    const idsA = new Set(parsedA.results.map((r) => r.id));
+
+    const outB = await runCtxCommand('ctx search "needle" --k 10 --session S-B --json', storage, config);
+    assert.equal(outB.ok, true);
+    const parsedB = JSON.parse(outB.text);
+    assert.ok(parsedB.hits >= 1);
+    const idsB = new Set(parsedB.results.map((r) => r.id));
+
+    // Ensure isolation: A and B result sets should not be identical for this setup.
+    assert.equal([...idsA].some((id) => idsB.has(id)), false);
+  });
+});
+
+test("ctx search --session excludes legacy rows without session_id", async () => {
+  await withTempStorage(async ({ storage, workspaceDir, config }) => {
+    const historyPath = path.join(workspaceDir, ".contextfs", "history.ndjson");
+    const rows = [
+      JSON.stringify({ role: "user", text: "legacy needle without session", ts: "2026-02-13T00:00:00.000Z" }),
+      JSON.stringify({ role: "assistant", text: "needle with session", ts: "2026-02-13T00:00:01.000Z", session_id: "S-A" }),
+    ].join("\n");
+    await fs.writeFile(historyPath, `${rows}\n`, "utf8");
+
+    const all = await runCtxCommand('ctx search "needle" --k 10 --json', storage, config);
+    assert.equal(all.ok, true);
+    const allParsed = JSON.parse(all.text);
+    assert.ok(allParsed.hits >= 2);
+
+    const filtered = await runCtxCommand('ctx search "needle" --k 10 --session S-A --json', storage, config);
+    assert.equal(filtered.ok, true);
+    const filteredParsed = JSON.parse(filtered.text);
+    assert.ok(filteredParsed.hits >= 1);
+    assert.equal(filteredParsed.results.some((r) => String(r.summary || "").includes("legacy needle")), false);
+  });
+});
+
+test("archive search --session filters archive index rows by session_id", async () => {
+  await withTempStorage(async ({ storage, config }) => {
+    const localConfig = {
+      ...config,
+      recentTurns: 1,
+      tokenThreshold: 1,
+      autoCompact: true,
+    };
+    await storage.appendHistory({ role: "user", text: "archive needle A", ts: "2026-02-14T00:00:00.000Z", session_id: "S-A" });
+    await storage.appendHistory({ role: "assistant", text: "archive needle B", ts: "2026-02-14T00:00:01.000Z", session_id: "S-B" });
+    await storage.appendHistory({ role: "user", text: "filler", ts: "2026-02-14T00:00:02.000Z", session_id: "S-A" });
+
+    await maybeCompact(storage, localConfig, true);
+
+    const outA = await runCtxCommand('ctx search "archive needle" --scope archive --k 10 --session S-A --json', storage, localConfig);
+    assert.equal(outA.ok, true);
+    const parsedA = JSON.parse(outA.text);
+    assert.ok(parsedA.hits >= 1);
+    assert.ok(parsedA.results.every((r) => String(r.summary || "").includes("archive needle A") || String(r.summary || "").includes("archive needle")));
+
+    const outB = await runCtxCommand('ctx search "archive needle" --scope archive --k 10 --session S-B --json', storage, localConfig);
+    assert.equal(outB.ok, true);
+    const parsedB = JSON.parse(outB.text);
+    assert.ok(parsedB.hits >= 1);
   });
 });
 
