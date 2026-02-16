@@ -50,6 +50,8 @@ cp -r <path-to-contextfs>/.opencode/plugins/contextfs .opencode/plugins/
 /ctx search "关键词" --k 5 --session current
 /ctx timeline H-xxx --before 3 --after 3 --session current
 /ctx get H-xxx --head 1200 --session current
+/ctx traces --tail 20
+/ctx trace T-xxxxxxxxxx
 /ctx stats --json
 /ctx pin "不要修改核心架构"
 /ctx compact                     # 手动触发压缩
@@ -96,6 +98,7 @@ ContextFS 把“检索与注入”分成三层，核心目的是省 token 且可
 - `history.ndjson`: 近期严格问答对（用户原问题 + 助手最终回答）
 - `history.archive.ndjson`: 归档历史
 - `history.archive.index.ndjson`: 归档检索索引
+- `retrieval.traces.ndjson`: 检索 trace（派生数据，可删可重建；可能轮转为 `retrieval.traces.N.ndjson`）
 
 ## 常见问题
 

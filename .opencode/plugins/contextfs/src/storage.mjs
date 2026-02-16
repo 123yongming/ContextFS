@@ -9,6 +9,7 @@ const FILES = {
   historyArchive: "history.archive.ndjson",
   historyArchiveIndex: "history.archive.index.ndjson",
   historyBad: "history.bad.ndjson",
+  retrievalTraces: "retrieval.traces.ndjson",
   state: "state.json",
 };
 
@@ -16,6 +17,7 @@ const LEGACY_FALLBACK_EPOCH_MS = 0;
 const RETRYABLE_LOCK_ERRORS = new Set(["EEXIST", "EBUSY"]);
 const LOCK_PERMISSION_ERRORS = new Set(["EPERM", "EACCES"]);
 const RETRYABLE_RENAME_ERRORS = new Set(["EBUSY", "EPERM", "EXDEV"]);
+const RETRYABLE_UNLINK_ERRORS = new Set(["EBUSY", "EPERM"]);
 
 function nowIso() {
   return new Date().toISOString();
@@ -197,6 +199,39 @@ function sleepMs(ms) {
 function makeTmpPath(target) {
   const rand = Math.random().toString(16).slice(2, 10);
   return `${target}.${process.pid}.${Date.now()}.${rand}.tmp`;
+}
+
+async function renameWithRetry(fromPath, toPath, maxRetries = 6) {
+  for (let i = 0; i <= maxRetries; i += 1) {
+    try {
+      await fs.rename(fromPath, toPath);
+      return true;
+    } catch (err) {
+      if (!RETRYABLE_RENAME_ERRORS.has(err?.code) || i === maxRetries) {
+        throw err;
+      }
+      await sleepMs(Math.min(80, 10 + i * 10));
+    }
+  }
+  return false;
+}
+
+async function unlinkWithRetry(targetPath, maxRetries = 6) {
+  for (let i = 0; i <= maxRetries; i += 1) {
+    try {
+      await fs.unlink(targetPath);
+      return true;
+    } catch (err) {
+      if (err?.code === "ENOENT") {
+        return false;
+      }
+      if (!RETRYABLE_UNLINK_ERRORS.has(err?.code) || i === maxRetries) {
+        throw err;
+      }
+      await sleepMs(Math.min(80, 10 + i * 10));
+    }
+  }
+  return false;
 }
 
 function serializeHistoryEntries(entries) {
@@ -383,6 +418,7 @@ export class ContextFsStorage {
     await this.ensureFile("history", "");
     await this.ensureFile("historyArchive", "");
     await this.ensureFile("historyArchiveIndex", "");
+    await this.ensureFile("retrievalTraces", "");
     await this.ensureFile("state", JSON.stringify(this.defaultState(), null, 2) + "\n");
 
     await this.refreshManifest();
@@ -495,6 +531,171 @@ export class ContextFsStorage {
 
   async readText(name) {
     return fs.readFile(this.resolve(name), "utf8");
+  }
+
+  async rotateRetrievalTracesIfNeededLocked(cfg, incomingBytes = 0) {
+    const config = cfg || this.config;
+    const maxBytes = Math.max(1024, Number(config.tracesMaxBytes || 0) || 0);
+    const maxFiles = Math.max(1, Math.min(10, Math.floor(Number(config.tracesMaxFiles || 0) || 0))) || 1;
+    const mainPath = this.resolve("retrievalTraces");
+    const incoming = Math.max(0, Number(incomingBytes) || 0);
+    let size = 0;
+    try {
+      size = (await fs.stat(mainPath)).size;
+    } catch (err) {
+      if (err?.code !== "ENOENT") {
+        throw err;
+      }
+      await fs.writeFile(mainPath, "", "utf8");
+      size = 0;
+    }
+    if ((size + incoming) <= maxBytes) {
+      return;
+    }
+
+    const rotated = (n) => path.join(this.baseDir, `retrieval.traces.${n}.ndjson`);
+
+    if (maxFiles >= 1) {
+      await unlinkWithRetry(rotated(maxFiles));
+      for (let i = maxFiles - 1; i >= 1; i -= 1) {
+        const from = rotated(i);
+        const to = rotated(i + 1);
+        try {
+          await renameWithRetry(from, to);
+        } catch (err) {
+          if (err?.code !== "ENOENT") {
+            throw err;
+          }
+        }
+      }
+      try {
+        await renameWithRetry(mainPath, rotated(1));
+      } catch (err) {
+        if (err?.code !== "ENOENT") {
+          throw err;
+        }
+      }
+    }
+
+    await fs.writeFile(mainPath, "", "utf8");
+  }
+
+  async appendRetrievalTrace(trace, options = {}) {
+    const config = options.config || this.config;
+    if (!config?.tracesEnabled) {
+      return false;
+    }
+    let lock = null;
+    try {
+      if (!options.locked) {
+        lock = await this.acquireLock();
+      }
+      const line = `${JSON.stringify(trace)}\n`;
+      const lineBytes = Buffer.byteLength(line, "utf8");
+      const maxBytes = Math.max(1024, Number(config.tracesMaxBytes || 0) || 0);
+
+      await this.rotateRetrievalTracesIfNeededLocked(config, lineBytes <= maxBytes ? lineBytes : 0);
+      await fs.appendFile(this.resolve("retrievalTraces"), line, "utf8");
+
+      // If a single trace line is larger than the configured cap, rotate immediately
+      // so retrieval.traces.ndjson remains bounded without waiting for another write.
+      if (lineBytes > maxBytes) {
+        await this.rotateRetrievalTracesIfNeededLocked(config, 0);
+      }
+      return true;
+    } catch (err) {
+      if (config?.debug) {
+        console.error(`[contextfs] failed to append retrieval trace: ${String(err?.message || err)}`);
+      }
+      return false;
+    } finally {
+      if (lock) {
+        await this.releaseLock(lock);
+      }
+    }
+  }
+
+  async readRetrievalTraces(options = {}) {
+    const config = options.config || this.config;
+    const tailRaw = Number(options.tail);
+    const tail = Number.isFinite(tailRaw) ? Math.max(1, Math.min(200, Math.floor(tailRaw))) : Math.max(1, Math.min(200, Number(config.tracesTailDefault || 20) || 20));
+    const maxFiles = Math.max(1, Math.min(10, Math.floor(Number(config.tracesMaxFiles || 0) || 0))) || 1;
+    const paths = [this.resolve("retrievalTraces")];
+    for (let i = 1; i <= maxFiles; i += 1) {
+      paths.push(path.join(this.baseDir, `retrieval.traces.${i}.ndjson`));
+    }
+
+    const out = [];
+
+    for (const p of paths) {
+      let raw = "";
+      try {
+        raw = await fs.readFile(p, "utf8");
+      } catch (err) {
+        if (err?.code === "ENOENT") {
+          continue;
+        }
+        throw err;
+      }
+      const lines = String(raw || "").split("\n");
+      for (let i = lines.length - 1; i >= 0; i -= 1) {
+        const line = safeTrim(lines[i]);
+        if (!line) {
+          continue;
+        }
+        try {
+          const parsed = JSON.parse(line);
+          out.push(parsed);
+          if (out.length >= tail) {
+            return out;
+          }
+        } catch {
+          // ignore bad trace lines
+        }
+      }
+    }
+
+    return out;
+  }
+
+  async findRetrievalTraceById(traceId, options = {}) {
+    const config = options.config || this.config;
+    const target = safeTrim(traceId);
+    if (!target) {
+      return null;
+    }
+    const maxFiles = Math.max(1, Math.min(10, Math.floor(Number(config.tracesMaxFiles || 0) || 0))) || 1;
+    const paths = [this.resolve("retrievalTraces")];
+    for (let i = 1; i <= maxFiles; i += 1) {
+      paths.push(path.join(this.baseDir, `retrieval.traces.${i}.ndjson`));
+    }
+    for (const p of paths) {
+      let raw = "";
+      try {
+        raw = await fs.readFile(p, "utf8");
+      } catch (err) {
+        if (err?.code === "ENOENT") {
+          continue;
+        }
+        throw err;
+      }
+      const lines = raw.split("\n");
+      for (let i = lines.length - 1; i >= 0; i -= 1) {
+        const line = safeTrim(lines[i]);
+        if (!line) {
+          continue;
+        }
+        try {
+          const parsed = JSON.parse(line);
+          if (safeTrim(parsed?.trace_id) === target) {
+            return parsed;
+          }
+        } catch {
+          // ignore bad trace lines
+        }
+      }
+    }
+    return null;
   }
 
   async writeText(name, content) {
@@ -825,6 +1026,7 @@ export class ContextFsStorage {
       "- history.ndjson | compactable turn history | tags: runtime,history",
       "- history.archive.ndjson | archived compacted turn history | tags: runtime,archive",
       "- history.archive.index.ndjson | archive retrieval index | tags: runtime,index",
+      "- retrieval.traces.ndjson | retrieval trace log (derived) | tags: runtime,trace",
       "",
       "## mode",
       `- autoInject: ${String(this.config.autoInject)}`,

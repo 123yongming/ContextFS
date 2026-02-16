@@ -1,3 +1,5 @@
+import crypto from "node:crypto";
+
 import { fileMap } from "./storage.mjs";
 import { addPin, parsePinsMarkdown } from "./pins.mjs";
 import { maybeCompact } from "./compactor.mjs";
@@ -91,6 +93,29 @@ function lineSummary(text, maxChars) {
     return oneLine;
   }
   return `${oneLine.slice(0, Math.max(0, maxChars - 3))}...`;
+}
+
+function safeOneLine(text, maxChars, truncatedFields, fieldName) {
+  const oneLine = String(text || "").replace(/\s+/g, " ").trim();
+  if (oneLine.length <= maxChars) {
+    return oneLine;
+  }
+  if (truncatedFields && fieldName) {
+    truncatedFields.add(fieldName);
+  }
+  return `${oneLine.slice(0, Math.max(0, maxChars - 3))}...`;
+}
+
+function makeTraceId(seed) {
+  const hash = crypto.createHash("sha256").update(String(seed || ""), "utf8").digest("hex").slice(0, 10);
+  return `T-${hash}`;
+}
+
+function sessionLabel(session) {
+  if (session?.mode === "id") {
+    return session.sessionId;
+  }
+  return "all";
 }
 
 function sizeBucket(tokens) {
@@ -364,6 +389,8 @@ export async function runCtxCommand(commandLine, storage, config) {
         "  ctx search \"<query>\" [--k 5] [--scope all|hot|archive] [--session all|current|<id>]",
         "  ctx timeline <id> [--before 3 --after 3] [--session all|current|<id>]",
         "  ctx get <id> [--head 1200] [--session all|current|<id>]",
+        "  ctx traces [--tail 20] [--json]",
+        "  ctx trace <trace_id> [--json]",
         "  ctx stats",
         "  ctx gc",
         "  ctx reindex",
@@ -461,6 +488,55 @@ export async function runCtxCommand(commandLine, storage, config) {
     return textResult(out);
   }
 
+  if (cmd === "traces") {
+    const asJson = hasFlag(args, "--json");
+    const tail = clampInt(toInt(getFlagValue(args, "--tail", config.tracesTailDefault), config.tracesTailDefault), 1, 200);
+    const traces = await storage.readRetrievalTraces({ tail, config });
+
+    if (asJson) {
+      return textResult(JSON.stringify({
+        layer: "TRACE",
+        tail,
+        hits: traces.length,
+        traces,
+      }, null, 2));
+    }
+
+    const lines = [
+      `# traces (tail=${tail}, hits=${traces.length})`,
+      "",
+      ...traces.map((t) => {
+        const id = String(t?.trace_id || "n/a");
+        const ts = String(t?.ts || "n/a");
+        const command = String(t?.command || "n/a");
+        const ok = String(Boolean(t?.ok));
+        const hint = safeTrim(t?.query) || safeTrim(t?.args?.id) || safeTrim(t?.args?.anchor) || "";
+        return `${id} | ${ts} | ${command} | ok=${ok}${hint ? ` | ${hint}` : ""}`;
+      }),
+    ];
+    return textResult(lines.join("\n"));
+  }
+
+  if (cmd === "trace") {
+    const asJson = hasFlag(args, "--json");
+    const cleanArgs = stripFlags(args, []);
+    const traceId = cleanArgs[0];
+    if (!traceId) {
+      return errorResult("usage: ctx trace <trace_id> [--json]");
+    }
+    const trace = await storage.findRetrievalTraceById(traceId, { config });
+    if (!trace) {
+      return errorResult(`trace not found: ${traceId}`);
+    }
+    if (asJson) {
+      return textResult(JSON.stringify({
+        layer: "TRACE",
+        trace,
+      }, null, 2));
+    }
+    return textResult(JSON.stringify(trace, null, 2));
+  }
+
   if (cmd === "pin") {
     const text = args.join(" ").trim();
     if (!text) {
@@ -486,18 +562,59 @@ export async function runCtxCommand(commandLine, storage, config) {
   }
 
   if (cmd === "search") {
+    const startedAt = Date.now();
+    const traceTs = new Date().toISOString();
     const asJson = hasFlag(args, "--json");
-    const session = await getSessionFilter(args, storage, 'ctx search "<query>" [--k 5] [--scope all|hot|archive] [--session all|current|<id>]');
-    if (session.error) {
-      return errorResult(session.error);
-    }
-    const cleanArgs = stripFlags(args, ["--k", "--session"]);
     const k = clampInt(toInt(getFlagValue(args, "--k", config.searchDefaultK), config.searchDefaultK), 1, 50);
     const scope = String(getFlagValue(args, "--scope", "all") || "all").toLowerCase();
+    const session = await getSessionFilter(args, storage, 'ctx search "<query>" [--k 5] [--scope all|hot|archive] [--session all|current|<id>]');
+
+    const traceArgs = {
+      k,
+      scope,
+      session: sessionLabel(session),
+    };
+    const traceBudgets = {
+      k,
+      summaryMaxChars: config.searchSummaryMaxChars,
+    };
+
+    const writeTraceError = async (message) => {
+      const state = await storage.readState();
+      await storage.appendRetrievalTrace({
+        trace_id: makeTraceId(`${traceTs}|search|${scope}|${k}|${String(session.sessionId || "")}|${state.revision || 0}`),
+        ts: traceTs,
+        ok: false,
+        command: "search",
+        args: traceArgs,
+        query: "",
+        inputs: {
+          scope,
+          session_mode: session.mode || "all",
+        },
+        ranking: [],
+        budgets: traceBudgets,
+        state_revision: state.revision || 0,
+        duration_ms: Date.now() - startedAt,
+        error: safeOneLine(message, 400),
+      }, { config });
+    };
+
+    if (session.error) {
+      await writeTraceError(session.error);
+      return errorResult(session.error);
+    }
+
+    const cleanArgs = stripFlags(args, ["--k", "--session"]);
     const query = stripFlags(cleanArgs, ["--scope"]).join(" ").trim();
     if (!query) {
+      await writeTraceError('usage: ctx search "<query>" [--k 5] [--scope all|hot|archive] [--session all|current|<id>]');
       return errorResult('usage: ctx search "<query>" [--k 5] [--scope all|hot|archive] [--session all|current|<id>]');
     }
+
+    const truncatedFields = new Set();
+    const queryTrace = safeOneLine(query, config.traceQueryMaxChars, truncatedFields, "query");
+
     const queryTokens = tokenize(query);
     const { history, archive } = await readHistoryByScope(storage, scope);
     const pool = mergeUniqueHistory(history, archive);
@@ -550,13 +667,44 @@ export async function runCtxCommand(commandLine, storage, config) {
       })(),
     }));
 
-    await storage.updateState((cur) => ({
+    const state = await storage.updateState((cur) => ({
       lastSearchHits: rows.length,
       lastSearchQuery: query,
       lastSearchAt: new Date().toISOString(),
       lastSearchIndex: rows,
       searchCount: (cur.searchCount || 0) + 1,
     }));
+
+    await storage.appendRetrievalTrace({
+      trace_id: makeTraceId(`${traceTs}|search|${queryTrace}|${k}|${scope}|${session.mode}|${String(session.sessionId || "")}|${state.revision || 0}`),
+      ts: traceTs,
+      ok: true,
+      command: "search",
+      args: traceArgs,
+      query: queryTrace,
+      inputs: {
+        pool: {
+          hot: history.length,
+          archive: archive.length,
+          merged_unique: pool.length,
+          session_filtered: sessionPool.length,
+        },
+        scope,
+        session_mode: session.mode,
+      },
+      ranking: rows.slice(0, config.traceRankingMaxItems).map((row) => ({
+        id: row.id,
+        ts: row.ts,
+        type: row.type,
+        source: row.source,
+        summary: row.summary,
+        score: row.score,
+      })),
+      budgets: traceBudgets,
+      ...(truncatedFields.size ? { truncation: { truncated: true, fields: Array.from(truncatedFields) } } : {}),
+      state_revision: state.revision || 0,
+      duration_ms: Date.now() - startedAt,
+    }, { config });
 
     if (asJson) {
       return textResult(JSON.stringify({
@@ -579,16 +727,12 @@ export async function runCtxCommand(commandLine, storage, config) {
   }
 
   if (cmd === "timeline") {
+    const startedAt = Date.now();
+    const traceTs = new Date().toISOString();
     const asJson = hasFlag(args, "--json");
     const session = await getSessionFilter(args, storage, "ctx timeline <id> [--before 3 --after 3] [--session all|current|<id>]");
-    if (session.error) {
-      return errorResult(session.error);
-    }
     const cleanArgs = stripFlags(args, ["--before", "--after", "--session"]);
     const anchorId = cleanArgs[0];
-    if (!anchorId) {
-      return errorResult("usage: ctx timeline <id> [--before 3 --after 3] [--session all|current|<id>]");
-    }
     const before = clampInt(
       toInt(getFlagValue(args, "--before", config.timelineBeforeDefault), config.timelineBeforeDefault),
       0,
@@ -599,6 +743,48 @@ export async function runCtxCommand(commandLine, storage, config) {
       0,
       20,
     );
+
+    const traceArgs = {
+      anchor: anchorId || "",
+      before,
+      after,
+      session: sessionLabel(session),
+    };
+    const traceBudgets = {
+      before,
+      after,
+      summaryMaxChars: config.searchSummaryMaxChars,
+    };
+
+    const writeTraceError = async (message) => {
+      const state = await storage.readState();
+      await storage.appendRetrievalTrace({
+        trace_id: makeTraceId(`${traceTs}|timeline|${String(anchorId || "")}|${before}|${after}|${String(session.sessionId || "")}|${state.revision || 0}`),
+        ts: traceTs,
+        ok: false,
+        command: "timeline",
+        args: traceArgs,
+        inputs: {
+          session_mode: session.mode || "all",
+        },
+        ranking: [],
+        budgets: traceBudgets,
+        state_revision: state.revision || 0,
+        duration_ms: Date.now() - startedAt,
+        error: safeOneLine(message, 400),
+      }, { config });
+    };
+
+    if (session.error) {
+      await writeTraceError(session.error);
+      return errorResult(session.error);
+    }
+
+    if (!anchorId) {
+      await writeTraceError("usage: ctx timeline <id> [--before 3 --after 3] [--session all|current|<id>]");
+      return errorResult("usage: ctx timeline <id> [--before 3 --after 3] [--session all|current|<id>]");
+    }
+
     const history = await storage.readHistory();
     const archive = asArchiveSearchRows(await storage.readHistoryArchiveIndex());
     const hotMatches = findIdMatches(history, anchorId);
@@ -606,6 +792,7 @@ export async function runCtxCommand(commandLine, storage, config) {
     const sourceList = hotMatches.length ? history : archive;
     let matches = hotMatches.length ? hotMatches : archiveMatches;
     if (!matches.length) {
+      await writeTraceError(`id not found: ${anchorId}`);
       return errorResult(`id not found: ${anchorId}`);
     }
     if (matches.length > 1) {
@@ -614,11 +801,14 @@ export async function runCtxCommand(commandLine, storage, config) {
         if (filtered.length === 1) {
           matches = filtered;
         } else if (!filtered.length) {
+          await writeTraceError(`id conflict: ${anchorId} (no match for session ${session.sessionId}). run ctx gc or migration to repair duplicate ids`);
           return errorResult(`id conflict: ${anchorId} (no match for session ${session.sessionId}). run ctx gc or migration to repair duplicate ids`);
         } else {
+          await writeTraceError(`id conflict: ${anchorId} (multiple matches in session ${session.sessionId}). run ctx gc or migration to repair duplicate ids`);
           return errorResult(`id conflict: ${anchorId} (multiple matches in session ${session.sessionId}). run ctx gc or migration to repair duplicate ids`);
         }
       } else {
+        await writeTraceError(`id conflict: ${anchorId}. run ctx gc or migration to repair duplicate ids`);
         return errorResult(`id conflict: ${anchorId}. run ctx gc or migration to repair duplicate ids`);
       }
     }
@@ -629,10 +819,36 @@ export async function runCtxCommand(commandLine, storage, config) {
     const sliceSource = hotMatches.length ? "hot" : "archive";
     const slice = sourceList.slice(start, end).map((entry) => toL0Row(entry, config, sliceSource));
 
-    await storage.updateState((cur) => ({
+    const state = await storage.updateState((cur) => ({
       timelineCount: (cur.timelineCount || 0) + 1,
       lastTimelineAnchor: resolvedId,
     }));
+
+    await storage.appendRetrievalTrace({
+      trace_id: makeTraceId(`${traceTs}|timeline|${resolvedId}|${before}|${after}|${sliceSource}|${String(session.sessionId || "")}|${state.revision || 0}`),
+      ts: traceTs,
+      ok: true,
+      command: "timeline",
+      args: {
+        ...traceArgs,
+        anchor: resolvedId,
+      },
+      inputs: {
+        source: sliceSource,
+        list_size: sourceList.length,
+        session_mode: session.mode,
+      },
+      ranking: slice.slice(0, config.traceRankingMaxItems).map((row) => ({
+        id: row.id,
+        ts: row.ts,
+        type: row.type,
+        source: row.source,
+        summary: row.summary,
+      })),
+      budgets: traceBudgets,
+      state_revision: state.revision || 0,
+      duration_ms: Date.now() - startedAt,
+    }, { config });
 
     if (asJson) {
       return textResult(JSON.stringify({
@@ -654,22 +870,56 @@ export async function runCtxCommand(commandLine, storage, config) {
   }
 
   if (cmd === "get") {
+    const startedAt = Date.now();
+    const traceTs = new Date().toISOString();
     const asJson = hasFlag(args, "--json");
     const session = await getSessionFilter(args, storage, "ctx get <id> [--head 1200] [--session all|current|<id>]");
+    const headRequested = clampInt(toInt(getFlagValue(args, "--head", config.getDefaultHead), config.getDefaultHead), 0, 200000);
+
+    const writeTraceError = async (idValue, message) => {
+      const state = await storage.readState();
+      await storage.appendRetrievalTrace({
+        trace_id: makeTraceId(`${traceTs}|get|${String(idValue || "")}|${headRequested}|${String(session.sessionId || "")}|${state.revision || 0}`),
+        ts: traceTs,
+        ok: false,
+        command: "get",
+        args: {
+          id: String(idValue || ""),
+          head: headRequested,
+          session: sessionLabel(session),
+        },
+        inputs: {
+          session_mode: session.mode || "all",
+        },
+        ranking: [],
+        budgets: {
+          head: headRequested,
+        },
+        state_revision: state.revision || 0,
+        duration_ms: Date.now() - startedAt,
+        error: safeOneLine(message, 400),
+      }, { config });
+    };
+
     if (session.error) {
+      await writeTraceError("", session.error);
       return errorResult(session.error);
     }
+
     const cleanArgs = stripFlags(args, ["--head", "--session"]);
     const id = cleanArgs[0];
     if (!id) {
+      await writeTraceError("", "usage: ctx get <id> [--head 1200] [--session all|current|<id>]");
       return errorResult("usage: ctx get <id> [--head 1200] [--session all|current|<id>]");
     }
-    const head = clampInt(toInt(getFlagValue(args, "--head", config.getDefaultHead), config.getDefaultHead), 0, 200000);
+
+    const head = headRequested;
     const history = await storage.readHistory();
     const hotMatches = findIdMatches(history, id);
     const archiveRow = await storage.findHistoryArchiveById(id);
     let matches = hotMatches.length ? hotMatches : (archiveRow ? [archiveRow] : []);
     if (!matches.length) {
+      await writeTraceError(id, `id not found: ${id}`);
       return errorResult(`id not found: ${id}`);
     }
     if (matches.length > 1) {
@@ -678,21 +928,38 @@ export async function runCtxCommand(commandLine, storage, config) {
         if (filtered.length === 1) {
           matches = filtered;
         } else if (!filtered.length) {
-          return errorResult(`id conflict: ${id} (no match for session ${session.sessionId}). run ctx gc or migration to repair duplicate ids`);
+          const message = `id conflict: ${id} (no match for session ${session.sessionId}). run ctx gc or migration to repair duplicate ids`;
+          await writeTraceError(id, message);
+          return errorResult(message);
         } else {
-          return errorResult(`id conflict: ${id} (multiple matches in session ${session.sessionId}). run ctx gc or migration to repair duplicate ids`);
+          const message = `id conflict: ${id} (multiple matches in session ${session.sessionId}). run ctx gc or migration to repair duplicate ids`;
+          await writeTraceError(id, message);
+          return errorResult(message);
         }
       } else {
-        return errorResult(`id conflict: ${id}. run ctx gc or migration to repair duplicate ids`);
+        const message = `id conflict: ${id}. run ctx gc or migration to repair duplicate ids`;
+        await writeTraceError(id, message);
+        return errorResult(message);
       }
     }
+
     const row = matches[0];
     const source = hotMatches.length ? "hot" : "archive";
-    await storage.updateState((cur) => ({
+    const ranking = [toL0Row(row, config, source)].slice(0, config.traceRankingMaxItems).map((r) => ({
+      id: r.id,
+      ts: r.ts,
+      type: r.type,
+      source: r.source,
+      summary: r.summary,
+    }));
+
+    const state = await storage.updateState((cur) => ({
       getCount: (cur.getCount || 0) + 1,
     }));
+
     if (asJson) {
       const jsonBudget = head > 0 ? head : config.getDefaultHead;
+      const truncationFields = new Set();
       const base = {
         layer: "L2",
         record: row,
@@ -703,6 +970,12 @@ export async function runCtxCommand(commandLine, storage, config) {
       let limited = applyJsonHeadLimit(base, jsonBudget, {
         headText: config.getDefaultHead,
       }).payload;
+      if (limited.truncated) {
+        truncationFields.add("text");
+        for (const field of Array.isArray(limited.truncated_fields) ? limited.truncated_fields : []) {
+          truncationFields.add(field);
+        }
+      }
       let json = JSON.stringify(limited, null, 2);
       let bytes = Buffer.byteLength(json, "utf8");
       let guard = 0;
@@ -715,17 +988,22 @@ export async function runCtxCommand(commandLine, storage, config) {
         if (refs.length > 0) {
           limited.record.refs = refs.slice(0, refs.length - 1);
           truncatedFields.add("refs");
+          truncationFields.add("refs");
         } else if (tags.length > 0) {
           limited.record.tags = tags.slice(0, tags.length - 1);
           truncatedFields.add("tags");
+          truncationFields.add("tags");
         } else if (textValue.length > 4) {
           const next = Math.max(4, textValue.length - 32);
           limited.record.text = `${textValue.slice(0, Math.max(0, next - 3))}...`;
           truncatedFields.add("text");
+          truncationFields.add("text");
         } else if (String(limited.record.id || "").length > 16) {
           limited.record.id = truncateValue(limited.record.id, 16, "id", truncatedFields);
+          truncationFields.add("id");
         } else if (String(limited.record.type || "").length > 16) {
           limited.record.type = truncateValue(limited.record.type, 16, "type", truncatedFields);
+          truncationFields.add("type");
         } else {
           break;
         }
@@ -750,6 +1028,9 @@ export async function runCtxCommand(commandLine, storage, config) {
           truncated_fields: Array.from(new Set([...truncatedFields, "refs", "tags", "text"])),
           original_sizes: limited.original_sizes,
         };
+        truncationFields.add("text");
+        truncationFields.add("refs");
+        truncationFields.add("tags");
         json = JSON.stringify(limited, null, 2);
       }
       if (Buffer.byteLength(json, "utf8") > jsonBudget) {
@@ -760,6 +1041,7 @@ export async function runCtxCommand(commandLine, storage, config) {
           effective_head: jsonBudget,
           note: "budget_too_small",
         };
+        truncationFields.add("text");
         let tinyJson = JSON.stringify(tiny);
         while (Buffer.byteLength(tinyJson, "utf8") > jsonBudget && tiny.id.length > 0) {
           tiny.id = tiny.id.slice(0, Math.max(0, tiny.id.length - 1));
@@ -775,12 +1057,87 @@ export async function runCtxCommand(commandLine, storage, config) {
         if (Buffer.byteLength(tinyJson, "utf8") > jsonBudget) {
           tinyJson = "{}";
         }
+
+        await storage.appendRetrievalTrace({
+          trace_id: makeTraceId(`${traceTs}|get|${id}|${jsonBudget}|${source}|${String(session.sessionId || "")}|${state.revision || 0}`),
+          ts: traceTs,
+          ok: true,
+          command: "get",
+          args: {
+            id,
+            head: jsonBudget,
+            session: sessionLabel(session),
+          },
+          inputs: {
+            source,
+            session_mode: session.mode,
+          },
+          ranking,
+          budgets: {
+            head: jsonBudget,
+          },
+          truncation: {
+            truncated: true,
+            fields: Array.from(truncationFields),
+          },
+          state_revision: state.revision || 0,
+          duration_ms: Date.now() - startedAt,
+        }, { config });
+
         return textResult(tinyJson);
       }
+
+      await storage.appendRetrievalTrace({
+        trace_id: makeTraceId(`${traceTs}|get|${id}|${jsonBudget}|${source}|${String(session.sessionId || "")}|${state.revision || 0}`),
+        ts: traceTs,
+        ok: true,
+        command: "get",
+        args: {
+          id,
+          head: jsonBudget,
+          session: sessionLabel(session),
+        },
+        inputs: {
+          source,
+          session_mode: session.mode,
+        },
+        ranking,
+        budgets: {
+          head: jsonBudget,
+        },
+        ...(truncationFields.size ? { truncation: { truncated: true, fields: Array.from(truncationFields) } } : {}),
+        state_revision: state.revision || 0,
+        duration_ms: Date.now() - startedAt,
+      }, { config });
+
       return textResult(json);
     }
+
     const full = JSON.stringify({ source, record: row }, null, 2);
     const clipped = head > 0 ? `${full.slice(0, head)}${full.length > head ? "\n..." : ""}` : full;
+
+    await storage.appendRetrievalTrace({
+      trace_id: makeTraceId(`${traceTs}|get|${id}|${head}|${source}|${String(session.sessionId || "")}|${state.revision || 0}`),
+      ts: traceTs,
+      ok: true,
+      command: "get",
+      args: {
+        id,
+        head,
+        session: sessionLabel(session),
+      },
+      inputs: {
+        source,
+        session_mode: session.mode,
+      },
+      ranking,
+      budgets: {
+        head,
+      },
+      state_revision: state.revision || 0,
+      duration_ms: Date.now() - startedAt,
+    }, { config });
+
     return textResult(clipped);
   }
 

@@ -1022,3 +1022,160 @@ test("readHistory migration bad-line quarantine is idempotent across repeated ru
     assert.equal(rewrittenLines.length, 2);
   });
 });
+
+function readLastTraceLine(raw) {
+  const lines = String(raw || "").split("\n").filter(Boolean);
+  if (!lines.length) {
+    return null;
+  }
+  return lines[lines.length - 1];
+}
+
+test("ctx search writes retrieval trace with stable schema", async () => {
+  await withTempStorage(async ({ storage, config }) => {
+    const long = `needle alpha ${"A".repeat(600)} UNLIKELY_TOKEN ${"B".repeat(600)}`;
+    await storage.appendHistory({ role: "user", text: long, ts: "2026-02-15T00:00:00.000Z" });
+
+    const out = await runCtxCommand('ctx search "needle" --k 3 --json', storage, config);
+    assert.equal(out.ok, true);
+
+    const raw = await storage.readText("retrievalTraces");
+    const lastLine = readLastTraceLine(raw);
+    assert.ok(lastLine);
+    assert.equal(lastLine.includes("UNLIKELY_TOKEN"), false);
+
+    const trace = JSON.parse(lastLine);
+    assert.equal(typeof trace.trace_id, "string");
+    assert.ok(trace.trace_id.startsWith("T-"));
+    assert.equal(trace.trace_id.length, 12);
+    assert.equal(trace.command, "search");
+    assert.equal(trace.ok, true);
+    assert.equal(typeof trace.ts, "string");
+    assert.equal(typeof trace.duration_ms, "number");
+    assert.equal(typeof trace.state_revision, "number");
+
+    assert.ok(trace.args);
+    assert.equal(trace.args.k, 3);
+    assert.equal(trace.args.scope, "all");
+
+    assert.ok(Array.isArray(trace.ranking));
+    assert.ok(trace.ranking.length >= 1);
+    for (const row of trace.ranking) {
+      assert.equal(typeof row.id, "string");
+      assert.equal(typeof row.ts, "string");
+      assert.equal(typeof row.type, "string");
+      assert.equal(typeof row.source, "string");
+      assert.equal(typeof row.summary, "string");
+      assert.equal(row.summary.includes("\n"), false);
+      assert.ok(row.summary.length <= config.searchSummaryMaxChars + 3);
+    }
+  });
+});
+
+test("ctx get trace records truncation fields under small head budget", async () => {
+  await withTempStorage(async ({ storage, config }) => {
+    const long = `head-limit-${"Z".repeat(5000)}`;
+    await storage.appendHistory({ role: "user", text: long, ts: "2026-02-15T00:01:00.000Z" });
+    const id = (await storage.readHistory())[0].id;
+
+    const out = await runCtxCommand(`ctx get ${id} --json --head 100`, storage, config);
+    assert.equal(out.ok, true);
+    assert.doesNotThrow(() => JSON.parse(out.text));
+
+    const raw = await storage.readText("retrievalTraces");
+    const lastLine = readLastTraceLine(raw);
+    assert.ok(lastLine);
+    const trace = JSON.parse(lastLine);
+    assert.equal(trace.command, "get");
+    assert.equal(trace.ok, true);
+    assert.ok(trace.truncation);
+    assert.equal(trace.truncation.truncated, true);
+    assert.ok(Array.isArray(trace.truncation.fields));
+    assert.ok(trace.truncation.fields.includes("text"));
+  });
+});
+
+test("ctx traces and ctx trace commands can read traces", async () => {
+  await withTempStorage(async ({ storage, config }) => {
+    await storage.appendHistory({ role: "user", text: "needle one", ts: "2026-02-15T00:02:00.000Z" });
+    await runCtxCommand('ctx search "needle" --k 1 --json', storage, config);
+
+    const tracesOut = await runCtxCommand("ctx traces --tail 1 --json", storage, config);
+    assert.equal(tracesOut.ok, true);
+    const parsed = JSON.parse(tracesOut.text);
+    assert.equal(parsed.layer, "TRACE");
+    assert.equal(parsed.tail, 1);
+    assert.ok(parsed.hits >= 1);
+    assert.ok(Array.isArray(parsed.traces));
+    assert.equal(parsed.traces.length, 1);
+    const traceId = parsed.traces[0].trace_id;
+    assert.ok(typeof traceId === "string" && traceId.startsWith("T-"));
+
+    const traceOut = await runCtxCommand(`ctx trace ${traceId} --json`, storage, config);
+    assert.equal(traceOut.ok, true);
+    const traceParsed = JSON.parse(traceOut.text);
+    assert.equal(traceParsed.layer, "TRACE");
+    assert.ok(traceParsed.trace);
+    assert.equal(traceParsed.trace.trace_id, traceId);
+  });
+});
+
+test("trace rotation keeps size bounded and remains parseable", async () => {
+  await withTempStorage(async ({ storage, workspaceDir }) => {
+    const localConfig = mergeConfig({
+      contextfsDir: ".contextfs",
+      tracesMaxBytes: 600,
+      tracesMaxFiles: 2,
+      tracesTailDefault: 50,
+    });
+
+    await storage.appendHistory({ role: "user", text: `needle ${"X".repeat(3000)}`, ts: "2026-02-15T00:03:00.000Z" });
+
+    for (let i = 0; i < 20; i += 1) {
+      const out = await runCtxCommand('ctx search "needle" --k 1 --json', storage, localConfig);
+      assert.equal(out.ok, true);
+    }
+
+    const rotatedPath = path.join(workspaceDir, ".contextfs", "retrieval.traces.1.ndjson");
+    const stat = await fs.stat(rotatedPath);
+    assert.ok(stat.size > 0);
+
+    const tracesOut = await runCtxCommand("ctx traces --tail 50 --json", storage, localConfig);
+    assert.equal(tracesOut.ok, true);
+    const parsed = JSON.parse(tracesOut.text);
+    assert.equal(parsed.layer, "TRACE");
+    assert.ok(parsed.hits >= 2);
+  });
+});
+
+test("single oversized trace write rotates immediately and keeps main trace file bounded", async () => {
+  await withTempStorage(async ({ storage, workspaceDir }) => {
+    const localConfig = mergeConfig({
+      contextfsDir: ".contextfs",
+      tracesMaxBytes: 600,
+      tracesMaxFiles: 2,
+      tracesTailDefault: 50,
+    });
+
+    for (let i = 0; i < 20; i += 1) {
+      await storage.appendHistory({
+        role: i % 2 ? "user" : "assistant",
+        text: `needle oversized trace ${i} ${"X".repeat(800)}`,
+        ts: `2026-02-15T00:04:${String(i).padStart(2, "0")}.000Z`,
+      });
+    }
+
+    const out = await runCtxCommand('ctx search "needle oversized trace" --k 8 --json', storage, localConfig);
+    assert.equal(out.ok, true);
+
+    const mainPath = path.join(workspaceDir, ".contextfs", "retrieval.traces.ndjson");
+    const mainStat = await fs.stat(mainPath);
+    assert.ok(mainStat.size <= localConfig.tracesMaxBytes);
+
+    const tracesOut = await runCtxCommand("ctx traces --tail 1 --json", storage, localConfig);
+    assert.equal(tracesOut.ok, true);
+    const parsed = JSON.parse(tracesOut.text);
+    assert.equal(parsed.layer, "TRACE");
+    assert.ok(parsed.hits >= 1);
+  });
+});

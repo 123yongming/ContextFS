@@ -11,6 +11,7 @@ Small, non-invasive OpenCode plugin to keep long sessions stable.
   - `history.ndjson` - Recent strict pairs only: original user prompt text + assistant final answer (NDJSON; no intermediate streaming/tool traces)
   - `history.archive.ndjson` - Archived compacted turns
   - `history.archive.index.ndjson` - Archive retrieval index
+  - `retrieval.traces.ndjson` - Retrieval trace log (derived, may rotate)
 
 - **Context Pack**: Builds fixed pack each turn
   - PINS (max 20 items)
@@ -46,6 +47,8 @@ ctx pin "..."       # Add a pin
 ctx search "..." [--k 5]                 # Search lightweight index rows
 ctx timeline <id> [--before 3 --after 3]  # Show context window around id
 ctx get <id> [--head 1200]                # Fetch full row by id
+ctx traces [--tail 20]                    # Read latest retrieval traces
+ctx trace <trace_id>                      # Read a single trace by id
 ctx compact         # Force compaction
 ctx pack            # Show current pack
 ctx gc              # Garbage collect
