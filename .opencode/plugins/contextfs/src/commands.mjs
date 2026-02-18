@@ -4,6 +4,7 @@ import { fileMap } from "./storage.mjs";
 import { addPin, parsePinsMarkdown } from "./pins.mjs";
 import { maybeCompact } from "./compactor.mjs";
 import { buildContextPack } from "./packer.mjs";
+import { cosineSimilarity, createEmbeddingProvider, hashEmbeddingText, normalizeEmbeddingText } from "./embedding.mjs";
 import { estimateTokens } from "./token.mjs";
 
 function parseArgs(raw) {
@@ -398,6 +399,103 @@ async function readHistoryByScope(storage, scope = "all") {
   return { history, archive };
 }
 
+function normalizeRetrievalMode(config) {
+  const mode = String(config?.retrievalMode || "hybrid").trim().toLowerCase();
+  if (mode === "lexical" || mode === "hybrid") {
+    return mode;
+  }
+  return "hybrid";
+}
+
+function shouldUseHybridRetrieval(config) {
+  return normalizeRetrievalMode(config) === "hybrid" && Boolean(config?.vectorEnabled);
+}
+
+function rrfScore(rank, k) {
+  const safeRank = Number(rank);
+  if (!Number.isFinite(safeRank) || safeRank <= 0) {
+    return 0;
+  }
+  return 1 / (k + safeRank);
+}
+
+function sourceForId(id, hotIds) {
+  return hotIds.has(String(id)) ? "hot" : "archive";
+}
+
+async function ensureVectorRows(storage, provider, entries, hotIds, config) {
+  const vectorRows = await storage.readHistoryEmbeddingView("all");
+  const byId = new Map(vectorRows.map((row) => [String(row.id), row]));
+  const staleIds = new Set();
+  const missingEntries = [];
+  for (const entry of entries) {
+    const id = String(entry?.id || "");
+    if (!id) {
+      continue;
+    }
+    const text = normalizeEmbeddingText(entry?.text || "", config.embeddingTextMaxChars);
+    if (!text) {
+      if (byId.has(id)) {
+        staleIds.add(id);
+        byId.delete(id);
+      }
+      continue;
+    }
+    const expectedHash = hashEmbeddingText(text);
+    const expectedSource = sourceForId(entry.id, hotIds);
+    const existing = byId.get(id);
+    const hasVector = Boolean(existing && Array.isArray(existing.vec) && existing.vec.length);
+    const hashMatches = String(existing?.text_hash || "") === expectedHash;
+    const sourceMatches = String(existing?.source || "") === expectedSource;
+    const dimMatches = Number(existing?.dim || 0) === Number(provider?.dim || 0);
+    const modelMatches = String(existing?.model || "") === String(provider?.model || "");
+    if (!hasVector || !hashMatches || !sourceMatches || !dimMatches || !modelMatches) {
+      staleIds.add(id);
+      byId.delete(id);
+      missingEntries.push({
+        entry,
+        text,
+        source: expectedSource,
+      });
+    }
+  }
+  if (staleIds.size) {
+    await storage.pruneHistoryEmbeddingByIds(Array.from(staleIds));
+  }
+  if (!missingEntries.length) {
+    return byId;
+  }
+  const appended = [];
+  for (const item of missingEntries) {
+    const entry = item.entry;
+    const text = String(item.text || "");
+    const expectedHash = hashEmbeddingText(text);
+    const embedded = await provider.embedText(text);
+    const vector = Array.isArray(embedded?.vector) ? embedded.vector : [];
+    if (!vector.length) {
+      continue;
+    }
+    appended.push({
+      id: String(entry.id),
+      ts: String(entry.ts || ""),
+      session_id: entry.session_id,
+      source: item.source,
+      model: String(embedded.model || provider.model || "unknown"),
+      dim: Number(embedded.dim) || vector.length,
+      text_hash: String(embedded.text_hash || expectedHash),
+      vec: vector,
+    });
+  }
+  if (!appended.length) {
+    return byId;
+  }
+  const written = await storage.appendHistoryEmbeddingRows(appended);
+  for (const row of written) {
+    byId.set(String(row.id), row);
+  }
+  return byId;
+}
+
 function safeFileName(name) {
   const map = fileMap();
   const target = String(name || "").toLowerCase();
@@ -412,6 +510,8 @@ function safeFileName(name) {
     "history.ndjson",
     "history.archive.ndjson",
     "history.archive.index.ndjson",
+    "history.embedding.hot.ndjson",
+    "history.embedding.archive.ndjson",
   ]);
   if (!allowed.has(target)) {
     return null;
@@ -756,19 +856,133 @@ export async function runCtxCommandArgs(rawArgv, storage, config) {
         ? pool
         : pool.filter((item) => String(item?.session_id || "") === String(session.sessionId || ""));
     const newestTs = sessionPool.length ? Date.parse(String(sessionPool[sessionPool.length - 1].ts || "")) : Date.now();
-    const ranked = sessionPool
+    const candidateMax = clampInt(
+      toInt(config.fusionCandidateMax, Math.max(k, config.vectorTopN || 20)),
+      k,
+      500,
+    );
+    const lexicalRanked = sessionPool
       .map((entry) => ({
         entry,
         score: scoreEntry(entry, queryTokens, newestTs),
       }))
       .filter((item) => item.score > 0)
       .sort((a, b) => (b.score - a.score) || String(b.entry.ts || "").localeCompare(String(a.entry.ts || "")))
-      .slice(0, k);
+      .slice(0, candidateMax);
+    const lexicalRankById = new Map();
+    for (let i = 0; i < lexicalRanked.length; i += 1) {
+      const item = lexicalRanked[i];
+      lexicalRankById.set(String(item.entry.id), {
+        rank: i + 1,
+        score: item.score,
+        entry: item.entry,
+      });
+    }
 
-    const rows = ranked.map(({ entry, score }) => ({
+    const retrievalModeConfigured = normalizeRetrievalMode(config);
+    let retrievalModeUsed = "lexical";
+    let vectorFallbackReason = "";
+    let vectorRanked = [];
+    if (shouldUseHybridRetrieval(config)) {
+      retrievalModeUsed = "hybrid";
+      try {
+        const provider = createEmbeddingProvider(config);
+        const queryEmbedding = await provider.embedText(query);
+        const byId = await ensureVectorRows(storage, provider, sessionPool, hotIds, config);
+        const vectorMinSimilarity = 0.35;
+        const vectorCandidates = [];
+        for (const entry of sessionPool) {
+          const id = String(entry?.id || "");
+          if (!id) {
+            continue;
+          }
+          const row = byId.get(id);
+          if (!row || !Array.isArray(row.vec) || !row.vec.length) {
+            continue;
+          }
+          const score = cosineSimilarity(queryEmbedding.vector, row.vec);
+          if (!Number.isFinite(score) || score < vectorMinSimilarity) {
+            continue;
+          }
+          vectorCandidates.push({
+            entry,
+            score,
+          });
+        }
+        const vectorLimit = clampInt(toInt(config.vectorTopN, 20), 1, 200);
+        vectorRanked = vectorCandidates
+          .sort((a, b) => (b.score - a.score) || String(b.entry.ts || "").localeCompare(String(a.entry.ts || "")))
+          .slice(0, Math.max(k, vectorLimit, candidateMax));
+      } catch (err) {
+        retrievalModeUsed = "lexical";
+        vectorFallbackReason = safeOneLine(String(err?.message || err), 220);
+      }
+    }
+    const vectorRankById = new Map();
+    for (let i = 0; i < vectorRanked.length; i += 1) {
+      const item = vectorRanked[i];
+      vectorRankById.set(String(item.entry.id), {
+        rank: i + 1,
+        score: item.score,
+        entry: item.entry,
+      });
+    }
+    const fusedRanked = [];
+    if (retrievalModeUsed === "hybrid" && vectorRankById.size > 0) {
+      const rrfK = clampInt(toInt(config.fusionRrfK, 60), 1, 500);
+      const merged = new Map();
+      for (const [id, lexical] of lexicalRankById) {
+        merged.set(id, {
+          entry: lexical.entry,
+          lexicalRank: lexical.rank,
+          lexicalScore: lexical.score,
+          vectorRank: null,
+          vectorScore: 0,
+        });
+      }
+      for (const [id, vector] of vectorRankById) {
+        if (!merged.has(id)) {
+          merged.set(id, {
+            entry: vector.entry,
+            lexicalRank: null,
+            lexicalScore: 0,
+            vectorRank: vector.rank,
+            vectorScore: vector.score,
+          });
+          continue;
+        }
+        const cur = merged.get(id);
+        cur.vectorRank = vector.rank;
+        cur.vectorScore = vector.score;
+      }
+      for (const item of merged.values()) {
+        fusedRanked.push({
+          ...item,
+          score: rrfScore(item.lexicalRank, rrfK) + rrfScore(item.vectorRank, rrfK),
+          match: item.lexicalRank && item.vectorRank ? "hybrid" : (item.vectorRank ? "vector" : "lexical"),
+        });
+      }
+      fusedRanked.sort((a, b) => (b.score - a.score) || String(b.entry.ts || "").localeCompare(String(a.entry.ts || "")));
+    }
+    const finalRanked = (retrievalModeUsed === "hybrid" && fusedRanked.length > 0)
+      ? fusedRanked.slice(0, k)
+      : lexicalRanked.slice(0, k).map((item, idx) => ({
+        entry: item.entry,
+        lexicalRank: idx + 1,
+        lexicalScore: item.score,
+        vectorRank: null,
+        vectorScore: 0,
+        score: item.score,
+        match: "lexical",
+      }));
+    const rows = finalRanked.map((item) => ({
       ...(() => {
-        const source = hotIds.has(String(entry.id)) ? "hot" : "archive";
-        const row = toL0Row(entry, config, source, { score: Number(score.toFixed(3)) });
+        const entry = item.entry;
+        const source = sourceForId(entry.id, hotIds);
+        const row = toL0Row(entry, config, source, {
+          score: Number(item.score.toFixed(3)),
+          match: item.match,
+        });
 
         const beforeDefault = config.timelineBeforeDefault;
         const afterDefault = config.timelineAfterDefault;
@@ -798,6 +1012,14 @@ export async function runCtxCommandArgs(rawArgv, storage, config) {
         return row;
       })(),
     }));
+    const retrievalStats = {
+      configured_mode: retrievalModeConfigured,
+      mode: retrievalModeUsed,
+      lexical_hits: lexicalRanked.length,
+      vector_hits: vectorRanked.length,
+      fused_hits: fusedRanked.length || rows.length,
+      ...(vectorFallbackReason ? { fallback_reason: vectorFallbackReason } : {}),
+    };
 
     const state = await storage.updateState((cur) => ({
       lastSearchHits: rows.length,
@@ -823,6 +1045,7 @@ export async function runCtxCommandArgs(rawArgv, storage, config) {
         },
         scope,
         session_mode: session.mode,
+        retrieval: retrievalStats,
       },
       ranking: rows.slice(0, config.traceRankingMaxItems).map((row) => ({
         id: row.id,
@@ -831,6 +1054,7 @@ export async function runCtxCommandArgs(rawArgv, storage, config) {
         source: row.source,
         summary: row.summary,
         score: row.score,
+        match: row.match,
       })),
       budgets: traceBudgets,
       ...(truncatedFields.size ? { truncation: { truncated: true, fields: Array.from(truncatedFields) } } : {}),
@@ -846,12 +1070,13 @@ export async function runCtxCommandArgs(rawArgv, storage, config) {
         scope,
         session: session.mode === "all" ? "all" : session.sessionId,
         hits: rows.length,
+        retrieval: retrievalStats,
         results: rows,
       }, null, 2));
     }
 
     const lines = [
-      `# search (${rows.length} hits, scope=${scope}, session=${session.mode === "all" ? "all" : session.sessionId})`,
+      `# search (${rows.length} hits, scope=${scope}, session=${session.mode === "all" ? "all" : session.sessionId}, mode=${retrievalStats.mode})`,
       "",
       ...rows.map((x) => `${x.id} | ${x.ts} | ${x.type} | ${x.source} | ${x.summary}`),
     ];
@@ -1286,6 +1511,11 @@ export async function runCtxCommandArgs(rawArgv, storage, config) {
   }
 
   if (cmd === "reindex") {
+    if (hasFlag(args, "--embedding") || hasFlag(args, "--embeddings")) {
+      return errorResult(
+        "ctx reindex only rebuilds history.archive.index.ndjson (lexical index); embedding files are maintained automatically",
+      );
+    }
     const result = await storage.rebuildHistoryArchiveIndex();
     return textResult(
       [
