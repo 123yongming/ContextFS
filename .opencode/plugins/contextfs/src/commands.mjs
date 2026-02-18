@@ -87,6 +87,64 @@ async function getSessionFilter(args, storage, usage) {
   return { mode: "id", sessionId: value };
 }
 
+async function getSessionForSave(args, storage, usage) {
+  const idx = args.indexOf("--session");
+  if (idx < 0) {
+    return { sessionId: null };
+  }
+  const raw = args[idx + 1];
+  if (isMissingFlagValue(raw)) {
+    return { error: `usage: ${usage}` };
+  }
+  const value = String(raw).trim();
+  const lower = value.toLowerCase();
+  if (lower === "all") {
+    return { error: "ctx save does not support --session all. use --session current or a specific session id." };
+  }
+  if (lower === "current") {
+    const state = await storage.readState();
+    const current = String(state.currentSessionId || "").trim();
+    if (!current) {
+      return {
+        error: "no current session id in state. run the plugin once (or provide --session <id>) to initialize a session.",
+      };
+    }
+    return { sessionId: current };
+  }
+  return { sessionId: value };
+}
+
+function normalizeSaveRole(input) {
+  const raw = String(input ?? "").trim();
+  if (!raw) {
+    return "assistant";
+  }
+  const lower = raw.toLowerCase();
+  if (lower === "human") {
+    return "user";
+  }
+  if (lower === "ai") {
+    return "assistant";
+  }
+  const allowed = new Set(["user", "assistant", "system", "tool", "note", "unknown"]);
+  if (!allowed.has(lower)) {
+    throw new Error("role must be one of: user|assistant|system|tool|note|unknown");
+  }
+  return lower;
+}
+
+function normalizeSaveType(input) {
+  const raw = String(input ?? "").trim();
+  if (!raw) {
+    return "note";
+  }
+  const clean = raw.toLowerCase();
+  if (!/^[a-z0-9_.:-]{1,64}$/.test(clean)) {
+    throw new Error("type must match /^[a-z0-9_.:-]{1,64}$/");
+  }
+  return clean;
+}
+
 function lineSummary(text, maxChars) {
   const oneLine = String(text || "").replace(/\s+/g, " ").trim();
   if (oneLine.length <= maxChars) {
@@ -372,8 +430,8 @@ function errorResult(text) {
   return { ok: false, text, exitCode: 1 };
 }
 
-export async function runCtxCommand(commandLine, storage, config) {
-  const argv = parseArgs(commandLine);
+export async function runCtxCommandArgs(rawArgv, storage, config) {
+  const argv = Array.isArray(rawArgv) ? rawArgv.map((part) => String(part ?? "")) : [];
   const cleaned = argv[0] === "ctx" ? argv.slice(1) : argv;
   const cmd = cleaned[0];
   const args = cleaned.slice(1);
@@ -385,6 +443,7 @@ export async function runCtxCommand(commandLine, storage, config) {
         "  ctx ls",
         "  ctx cat <file> [--head 30]",
         "  ctx pin \"<text>\"",
+        "  ctx save \"<text>\" [--title \"...\"] [--role user|assistant|system|tool|note|unknown] [--type note] [--session current|<id>] [--json]",
         "  ctx compact",
         "  ctx search \"<query>\" [--k 5] [--scope all|hot|archive] [--session all|current|<id>]",
         "  ctx timeline <id> [--before 3 --after 3] [--session all|current|<id>]",
@@ -545,6 +604,79 @@ export async function runCtxCommand(commandLine, storage, config) {
     const merged = await addPin(storage, text, config);
     await storage.refreshManifest();
     return textResult(`pin added (deduped): count=${merged.length}`);
+  }
+
+  if (cmd === "save") {
+    const asJson = hasFlag(args, "--json");
+    const usage = "ctx save \"<text>\" [--title \"...\"] [--role user|assistant|system|tool|note|unknown] [--type note] [--session current|<id>] [--json]";
+    const session = await getSessionForSave(args, storage, usage);
+    if (session.error) {
+      return errorResult(session.error);
+    }
+    const titleRaw = getFlagValue(args, "--title", "");
+    const roleRaw = getFlagValue(args, "--role", "");
+    const typeRaw = getFlagValue(args, "--type", "");
+    if (args.includes("--title") && isMissingFlagValue(titleRaw)) {
+      return errorResult(`usage: ${usage}`);
+    }
+    if (args.includes("--role") && isMissingFlagValue(roleRaw)) {
+      return errorResult(`usage: ${usage}`);
+    }
+    if (args.includes("--type") && isMissingFlagValue(typeRaw)) {
+      return errorResult(`usage: ${usage}`);
+    }
+    const cleanArgs = stripFlags(args, ["--title", "--role", "--type", "--session"]);
+    const text = cleanArgs.join(" ").trim();
+    if (!text) {
+      return errorResult(`usage: ${usage}`);
+    }
+    let role;
+    let type;
+    try {
+      role = normalizeSaveRole(roleRaw);
+      type = normalizeSaveType(typeRaw);
+    } catch (err) {
+      return errorResult(String(err?.message || err || "invalid save arguments"));
+    }
+    const title = String(titleRaw || "").trim();
+    const storedText = title ? `[title] ${title}\n${text}` : text;
+    const record = await storage.appendHistory({
+      role,
+      type,
+      text: storedText,
+      ...(title ? { tags: [`title:${title}`] } : {}),
+      ...(session.sessionId ? { session_id: session.sessionId } : {}),
+      ts: new Date().toISOString(),
+    });
+    await storage.refreshManifest();
+    const payload = {
+      layer: "WRITE",
+      action: "save_memory",
+      record: {
+        id: record.id,
+        ts: record.ts,
+        role: record.role,
+        type: record.type,
+        session_id: record.session_id || null,
+        title: title || null,
+        text_preview: lineSummary(record.text, config.searchSummaryMaxChars),
+        text_len: String(record.text || "").length,
+      },
+    };
+    const jsonOut = jsonOrText(payload, asJson);
+    if (jsonOut) {
+      return jsonOut;
+    }
+    return textResult(
+      [
+        `saved memory: ${payload.record.id}`,
+        `- ts: ${payload.record.ts}`,
+        `- role: ${payload.record.role}`,
+        `- type: ${payload.record.type}`,
+        `- session: ${payload.record.session_id || "none"}`,
+        `- preview: ${payload.record.text_preview}`,
+      ].join("\n"),
+    );
   }
 
   if (cmd === "compact") {
@@ -1166,4 +1298,8 @@ export async function runCtxCommand(commandLine, storage, config) {
   }
 
   return errorResult(`unknown ctx command: ${cmd}`);
+}
+
+export async function runCtxCommand(commandLine, storage, config) {
+  return runCtxCommandArgs(parseArgs(commandLine), storage, config);
 }

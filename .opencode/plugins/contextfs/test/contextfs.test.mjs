@@ -12,7 +12,6 @@ import { maybeCompact } from "../src/compactor.mjs";
 import { mergeConfig } from "../src/config.mjs";
 import { ContextFsStorage } from "../src/storage.mjs";
 import { runCtxCommand } from "../src/commands.mjs";
-
 test("estimateTokens is stable and monotonic", () => {
   const a = estimateTokens("abcd");
   const b = estimateTokens("abcdefgh");
@@ -1177,5 +1176,58 @@ test("single oversized trace write rotates immediately and keeps main trace file
     const parsed = JSON.parse(tracesOut.text);
     assert.equal(parsed.layer, "TRACE");
     assert.ok(parsed.hits >= 1);
+  });
+});
+
+test("ctx save persists explicit memory and keeps it retrievable", async () => {
+  await withTempStorage(async ({ storage, config }) => {
+    const saveOut = await runCtxCommand(
+      'ctx save "Investigated auth token refresh path" --title "Auth Tokens" --role assistant --type decision --session S-SAVE --json',
+      storage,
+      config,
+    );
+    assert.equal(saveOut.ok, true);
+    const savePayload = JSON.parse(saveOut.text);
+    assert.equal(savePayload.layer, "WRITE");
+    assert.equal(savePayload.action, "save_memory");
+    assert.equal(typeof savePayload.record?.id, "string");
+    assert.equal(savePayload.record?.session_id, "S-SAVE");
+    const savedId = String(savePayload.record.id || "");
+    assert.ok(savedId);
+
+    const searchOut = await runCtxCommand(
+      'ctx search "auth token refresh" --k 5 --scope all --session S-SAVE --json',
+      storage,
+      config,
+    );
+    assert.equal(searchOut.ok, true);
+    const searchPayload = JSON.parse(searchOut.text);
+    assert.equal(searchPayload.layer, "L0");
+    assert.ok(Array.isArray(searchPayload.results));
+    assert.ok(searchPayload.results.some((row) => String(row.id) === savedId));
+
+    const getOut = await runCtxCommand(`ctx get ${savedId} --session S-SAVE --json`, storage, config);
+    assert.equal(getOut.ok, true);
+    const getPayload = JSON.parse(getOut.text);
+    assert.equal(getPayload.layer, "L2");
+    assert.equal(String(getPayload.record.id), savedId);
+    assert.equal(String(getPayload.record.type), "decision");
+    assert.ok(String(getPayload.record.text || "").includes("Investigated auth token refresh path"));
+  });
+});
+
+test("ctx save validates required text, role, and session constraints", async () => {
+  await withTempStorage(async ({ storage, config }) => {
+    const missingText = await runCtxCommand("ctx save --json", storage, config);
+    assert.equal(missingText.ok, false);
+    assert.ok(missingText.text.includes("usage: ctx save"));
+
+    const invalidSessionAll = await runCtxCommand('ctx save "hello" --session all', storage, config);
+    assert.equal(invalidSessionAll.ok, false);
+    assert.ok(invalidSessionAll.text.includes("does not support --session all"));
+
+    const invalidRole = await runCtxCommand('ctx save "hello" --role nope', storage, config);
+    assert.equal(invalidRole.ok, false);
+    assert.ok(invalidRole.text.includes("role must be one of"));
   });
 });
