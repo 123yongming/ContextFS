@@ -1,6 +1,8 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 
+import { createEmbeddingProvider, hashEmbeddingText, normalizeEmbeddingText } from "./embedding.mjs";
+
 const FILES = {
   manifest: "manifest.md",
   pins: "pins.md",
@@ -8,6 +10,8 @@ const FILES = {
   history: "history.ndjson",
   historyArchive: "history.archive.ndjson",
   historyArchiveIndex: "history.archive.index.ndjson",
+  historyEmbeddingHot: "history.embedding.hot.ndjson",
+  historyEmbeddingArchive: "history.embedding.archive.ndjson",
   historyBad: "history.bad.ndjson",
   retrievalTraces: "retrieval.traces.ndjson",
   state: "state.json",
@@ -241,6 +245,21 @@ function serializeHistoryEntries(entries) {
   return `${entries.map((item) => JSON.stringify(item)).join("\n")}\n`;
 }
 
+function serializeEmbeddingEntries(entries) {
+  if (!entries.length) {
+    return "";
+  }
+  return `${entries.map((item) => JSON.stringify(item)).join("\n")}\n`;
+}
+
+function embeddingStatsFromRaw(rawText) {
+  const lines = String(rawText || "").split("\n").filter((line) => safeTrim(line)).length;
+  return {
+    lines,
+    bytes: Buffer.byteLength(String(rawText || ""), "utf8"),
+  };
+}
+
 function summarizeText(text, maxChars = 240) {
   const oneLine = String(text || "").replace(/\s+/g, " ").trim();
   if (oneLine.length <= maxChars) {
@@ -289,6 +308,82 @@ function parseArchiveIndexText(rawText) {
       });
     } catch {
       // ignore bad archive index lines
+    }
+  }
+  return Array.from(byId.values()).sort((a, b) => String(a.ts || "").localeCompare(String(b.ts || "")));
+}
+
+function normalizeEmbeddingSource(value, fallback = "hot") {
+  const clean = safeTrim(value).toLowerCase();
+  if (clean === "archive") {
+    return "archive";
+  }
+  return fallback === "archive" ? "archive" : "hot";
+}
+
+function normalizeEmbeddingDim(value, fallback = 64) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) {
+    return fallback;
+  }
+  const dim = Math.floor(n);
+  return Math.max(8, Math.min(4096, dim));
+}
+
+function normalizeEmbeddingVector(value, dim) {
+  const targetDim = normalizeEmbeddingDim(dim, 64);
+  const src = Array.isArray(value) ? value : [];
+  const out = new Array(targetDim).fill(0);
+  for (let i = 0; i < Math.min(targetDim, src.length); i += 1) {
+    const n = Number(src[i]);
+    out[i] = Number.isFinite(n) ? n : 0;
+  }
+  return out;
+}
+
+function normalizeEmbeddingIndexEntry(raw, fallbackTs = stableFallbackTs(0), sourceFallback = "hot") {
+  const src = raw && typeof raw === "object" ? raw : {};
+  const id = safeTrim(src.id);
+  if (!id) {
+    return null;
+  }
+  const ts = normalizeTs(src.ts, fallbackTs);
+  const dim = normalizeEmbeddingDim(src.dim, Array.isArray(src.vec) ? src.vec.length : 64);
+  const vec = normalizeEmbeddingVector(src.vec, dim);
+  if (!vec.length) {
+    return null;
+  }
+  const model = safeTrim(src.model) || "unknown";
+  const session_id = normalizeSessionId(src.session_id ?? src.sessionId ?? src.session);
+  const text_hash = safeTrim(src.text_hash ?? src.textHash);
+  return {
+    id,
+    ts,
+    session_id,
+    source: normalizeEmbeddingSource(src.source, sourceFallback),
+    model,
+    dim: vec.length,
+    text_hash,
+    vec,
+  };
+}
+
+function parseEmbeddingIndexText(rawText, sourceFallback = "hot") {
+  const lines = String(rawText || "").split("\n");
+  const byId = new Map();
+  for (let idx = 0; idx < lines.length; idx += 1) {
+    const line = safeTrim(lines[idx]);
+    if (!line) {
+      continue;
+    }
+    try {
+      const parsed = normalizeEmbeddingIndexEntry(JSON.parse(line), stableFallbackTs(idx), sourceFallback);
+      if (!parsed) {
+        continue;
+      }
+      byId.set(String(parsed.id), parsed);
+    } catch {
+      // ignore bad embedding index lines.
     }
   }
   return Array.from(byId.values()).sort((a, b) => String(a.ts || "").localeCompare(String(b.ts || "")));
@@ -418,6 +513,8 @@ export class ContextFsStorage {
     await this.ensureFile("history", "");
     await this.ensureFile("historyArchive", "");
     await this.ensureFile("historyArchiveIndex", "");
+    await this.ensureFile("historyEmbeddingHot", "");
+    await this.ensureFile("historyEmbeddingArchive", "");
     await this.ensureFile("retrievalTraces", "");
     await this.ensureFile("state", JSON.stringify(this.defaultState(), null, 2) + "\n");
 
@@ -430,6 +527,59 @@ export class ContextFsStorage {
       await fs.access(filePath);
     } catch {
       await fs.writeFile(filePath, fallback, "utf8");
+    }
+  }
+
+  async buildEmbeddingRowsForEntries(entries, source = "hot") {
+    const provider = createEmbeddingProvider(this.config);
+    if (!provider.enabled) {
+      return [];
+    }
+    const list = Array.isArray(entries) ? entries : [];
+    const rows = [];
+    for (const entry of list) {
+      const normalized = normalizeEntry(entry, nowIso());
+      const text = normalizeEmbeddingText(normalized.text, this.config.embeddingTextMaxChars);
+      if (!text) {
+        continue;
+      }
+      const embedded = await provider.embedText(text);
+      const vec = normalizeEmbeddingVector(embedded.vector, embedded.dim || provider.dim);
+      if (!vec.length) {
+        continue;
+      }
+      rows.push({
+        id: String(normalized.id || ""),
+        ts: normalizeTs(normalized.ts, nowIso()),
+        session_id: normalizeSessionId(normalized.session_id),
+        source: normalizeEmbeddingSource(source),
+        model: safeTrim(embedded.model) || safeTrim(provider.model) || "unknown",
+        dim: vec.length,
+        text_hash: safeTrim(embedded.text_hash) || hashEmbeddingText(text),
+        vec,
+      });
+    }
+    return rows.filter((item) => Boolean(item.id));
+  }
+
+  async tryUpsertEmbeddingRows(entries, source = "hot", options = {}) {
+    try {
+      const rows = await this.buildEmbeddingRowsForEntries(entries, source);
+      if (!rows.length) {
+        return 0;
+      }
+      await this.appendHistoryEmbeddingRows(rows, {
+        locked: Boolean(options.locked),
+      });
+      if (!options.locked) {
+        await this.compactEmbeddingIndexesIfNeeded();
+      }
+      return rows.length;
+    } catch (err) {
+      if (this.config?.debug) {
+        console.error(`[contextfs] failed to upsert embedding rows: ${String(err?.message || err)}`);
+      }
+      return 0;
     }
   }
 
@@ -878,6 +1028,48 @@ export class ContextFsStorage {
     return parseArchiveIndexText(raw);
   }
 
+  async readHistoryEmbeddingHot() {
+    const raw = await this.readText("historyEmbeddingHot");
+    if (!safeTrim(raw)) {
+      return [];
+    }
+    return parseEmbeddingIndexText(raw, "hot");
+  }
+
+  async readHistoryEmbeddingArchive() {
+    const raw = await this.readText("historyEmbeddingArchive");
+    if (!safeTrim(raw)) {
+      return [];
+    }
+    return parseEmbeddingIndexText(raw, "archive");
+  }
+
+  async readHistoryEmbeddingView(scope = "all") {
+    const normalizedScope = String(scope || "all").toLowerCase();
+    if (normalizedScope === "hot") {
+      return this.readHistoryEmbeddingHot();
+    }
+    if (normalizedScope === "archive") {
+      return this.readHistoryEmbeddingArchive();
+    }
+    const hot = await this.readHistoryEmbeddingHot();
+    const archive = await this.readHistoryEmbeddingArchive();
+    const byId = new Map();
+    for (const row of hot) {
+      byId.set(String(row.id), {
+        ...row,
+        source: "hot",
+      });
+    }
+    for (const row of archive) {
+      byId.set(String(row.id), {
+        ...row,
+        source: "archive",
+      });
+    }
+    return Array.from(byId.values()).sort((a, b) => String(a.ts || "").localeCompare(String(b.ts || "")));
+  }
+
   async rebuildHistoryArchiveIndex(options = {}) {
     const lock = options.locked ? null : await this.acquireLock();
     try {
@@ -927,6 +1119,205 @@ export class ContextFsStorage {
     return null;
   }
 
+  async upsertHistoryEmbeddingRowsBySource(rows, source = "hot", options = {}) {
+    const normalizedSource = normalizeEmbeddingSource(source);
+    const list = Array.isArray(rows) ? rows : [];
+    const normalized = [];
+    for (let i = 0; i < list.length; i += 1) {
+      const row = normalizeEmbeddingIndexEntry(list[i], nowIso(), normalizedSource);
+      if (!row) {
+        continue;
+      }
+      row.source = normalizedSource;
+      normalized.push(row);
+    }
+    if (!normalized.length) {
+      return [];
+    }
+    const lock = options.locked ? null : await this.acquireLock();
+    try {
+      const existing = normalizedSource === "archive"
+        ? await this.readHistoryEmbeddingArchive()
+        : await this.readHistoryEmbeddingHot();
+      const byId = new Map(existing.map((item) => [String(item.id), item]));
+      for (const row of normalized) {
+        byId.set(String(row.id), row);
+      }
+      const nextRows = Array.from(byId.values())
+        .map((item) => ({ ...item, source: normalizedSource }))
+        .sort((a, b) => String(a.ts || "").localeCompare(String(b.ts || "")));
+      const target = normalizedSource === "archive" ? "historyEmbeddingArchive" : "historyEmbeddingHot";
+      await this.writeTextWithLock(target, serializeEmbeddingEntries(nextRows));
+      return normalized;
+    } finally {
+      if (lock) {
+        await this.releaseLock(lock);
+      }
+    }
+  }
+
+  async upsertHistoryEmbeddingHot(rows, options = {}) {
+    return this.upsertHistoryEmbeddingRowsBySource(rows, "hot", options);
+  }
+
+  async upsertHistoryEmbeddingArchive(rows, options = {}) {
+    return this.upsertHistoryEmbeddingRowsBySource(rows, "archive", options);
+  }
+
+  async pruneHistoryEmbeddingHotByIds(ids, options = {}) {
+    const set = new Set((Array.isArray(ids) ? ids : []).map((id) => String(id || "")).filter(Boolean));
+    if (!set.size) {
+      return 0;
+    }
+    const lock = options.locked ? null : await this.acquireLock();
+    try {
+      const existing = await this.readHistoryEmbeddingHot();
+      const filtered = existing.filter((row) => !set.has(String(row.id)));
+      if (filtered.length === existing.length) {
+        return 0;
+      }
+      await this.writeTextWithLock("historyEmbeddingHot", serializeEmbeddingEntries(filtered));
+      return existing.length - filtered.length;
+    } finally {
+      if (lock) {
+        await this.releaseLock(lock);
+      }
+    }
+  }
+
+  async pruneHistoryEmbeddingArchiveByIds(ids, options = {}) {
+    const set = new Set((Array.isArray(ids) ? ids : []).map((id) => String(id || "")).filter(Boolean));
+    if (!set.size) {
+      return 0;
+    }
+    const lock = options.locked ? null : await this.acquireLock();
+    try {
+      const existing = await this.readHistoryEmbeddingArchive();
+      const filtered = existing.filter((row) => !set.has(String(row.id)));
+      if (filtered.length === existing.length) {
+        return 0;
+      }
+      await this.writeTextWithLock("historyEmbeddingArchive", serializeEmbeddingEntries(filtered));
+      return existing.length - filtered.length;
+    } finally {
+      if (lock) {
+        await this.releaseLock(lock);
+      }
+    }
+  }
+
+  async pruneHistoryEmbeddingByIds(ids, options = {}) {
+    const list = Array.isArray(ids) ? ids : [];
+    if (!list.length) {
+      return { hot: 0, archive: 0, total: 0 };
+    }
+    const lock = options.locked ? null : await this.acquireLock();
+    try {
+      const hot = await this.pruneHistoryEmbeddingHotByIds(list, { locked: true });
+      const archive = await this.pruneHistoryEmbeddingArchiveByIds(list, { locked: true });
+      return {
+        hot,
+        archive,
+        total: hot + archive,
+      };
+    } finally {
+      if (lock) {
+        await this.releaseLock(lock);
+      }
+    }
+  }
+
+  async appendHistoryEmbeddingRows(rows, options = {}) {
+    const list = Array.isArray(rows) ? rows : [];
+    const normalized = [];
+    for (let i = 0; i < list.length; i += 1) {
+      const row = normalizeEmbeddingIndexEntry(list[i], nowIso());
+      if (!row) {
+        continue;
+      }
+      normalized.push(row);
+    }
+    if (!normalized.length) {
+      return [];
+    }
+    const lock = options.locked ? null : await this.acquireLock();
+    try {
+      const hotRows = normalized.filter((row) => row.source === "hot");
+      const archiveRows = normalized.filter((row) => row.source === "archive");
+      if (hotRows.length) {
+        await this.upsertHistoryEmbeddingHot(hotRows, { locked: true });
+      }
+      if (archiveRows.length) {
+        await this.upsertHistoryEmbeddingArchive(archiveRows, { locked: true });
+        await this.pruneHistoryEmbeddingHotByIds(archiveRows.map((row) => row.id), { locked: true });
+      }
+      return normalized;
+    } finally {
+      if (lock) {
+        await this.releaseLock(lock);
+      }
+    }
+  }
+
+  async upsertHistoryEmbeddingRow(row, options = {}) {
+    const list = await this.appendHistoryEmbeddingRows([row], options);
+    return list[0] || null;
+  }
+
+  async compactEmbeddingIndexesIfNeeded(options = {}) {
+    const force = Boolean(options.force);
+    if (!force && !this.config.embeddingAutoCompact) {
+      return { compacted: false };
+    }
+    const lock = options.locked ? null : await this.acquireLock();
+    try {
+      const hotRaw = await this.readText("historyEmbeddingHot");
+      const archiveRaw = await this.readText("historyEmbeddingArchive");
+      const hotRows = parseEmbeddingIndexText(hotRaw, "hot");
+      const archiveRows = parseEmbeddingIndexText(archiveRaw, "archive");
+      const archiveIds = new Set(archiveRows.map((row) => String(row.id)));
+      const hotFiltered = hotRows.filter((row) => !archiveIds.has(String(row.id)));
+
+      const hotStats = embeddingStatsFromRaw(hotRaw);
+      const archiveStats = embeddingStatsFromRaw(archiveRaw);
+      const mergedById = new Map();
+      for (const row of hotRows) {
+        mergedById.set(String(row.id), row);
+      }
+      for (const row of archiveRows) {
+        mergedById.set(String(row.id), row);
+      }
+      const totalLines = hotStats.lines + archiveStats.lines;
+      const totalUnique = mergedById.size;
+      const duplicateRatio = totalLines > 0 ? (totalLines - totalUnique) / totalLines : 0;
+      const needsCompact = force
+        || hotStats.bytes > Number(this.config.embeddingHotMaxBytes || 0)
+        || archiveStats.bytes > Number(this.config.embeddingArchiveMaxBytes || 0)
+        || duplicateRatio > Number(this.config.embeddingDupRatioThreshold || 0)
+        || hotFiltered.length !== hotRows.length;
+      if (!needsCompact) {
+        return {
+          compacted: false,
+          hot_lines: hotStats.lines,
+          archive_lines: archiveStats.lines,
+          duplicate_ratio: Number(duplicateRatio.toFixed(4)),
+        };
+      }
+      await this.writeTextWithLock("historyEmbeddingHot", serializeEmbeddingEntries(hotFiltered));
+      await this.writeTextWithLock("historyEmbeddingArchive", serializeEmbeddingEntries(archiveRows));
+      return {
+        compacted: true,
+        hot_lines: hotFiltered.length,
+        archive_lines: archiveRows.length,
+        duplicate_ratio: Number(duplicateRatio.toFixed(4)),
+      };
+    } finally {
+      if (lock) {
+        await this.releaseLock(lock);
+      }
+    }
+  }
+
   async writeHistory(items) {
     const normalized = normalizeHistoryItems(items);
     await this.writeText("history", serializeHistoryEntries(normalized));
@@ -938,6 +1329,7 @@ export class ContextFsStorage {
       return null;
     }
     const lock = await this.acquireLock();
+    let updated = null;
     try {
       const raw = await this.readText("history");
       const parsed = parseHistoryText(raw);
@@ -963,25 +1355,35 @@ export class ContextFsStorage {
       parsed.entries[idx] = normalized;
 
       await this.writeTextWithLock("history", serializeHistoryEntries(parsed.entries));
-      return normalized;
+      updated = normalized;
     } finally {
       await this.releaseLock(lock);
     }
+    if (!updated) {
+      return null;
+    }
+    await this.tryUpsertEmbeddingRows([updated], "hot");
+    return updated;
   }
 
   async appendHistory(entry) {
     const lock = await this.acquireLock();
+    let normalized = null;
     try {
       const raw = await this.readText("history");
       const parsed = parseHistoryText(raw);
       const usedIds = new Set(parsed.entries.map((item) => item.id));
-      const normalized = normalizeEntry(entry, nowIso());
+      normalized = normalizeEntry(entry, nowIso());
       normalized.id = makeUniqueId(normalized.id, usedIds);
       await fs.appendFile(this.resolve("history"), `${JSON.stringify(normalized)}\n`, "utf8");
-      return normalized;
     } finally {
       await this.releaseLock(lock);
     }
+    if (!normalized) {
+      return null;
+    }
+    await this.tryUpsertEmbeddingRows([normalized], "hot");
+    return normalized;
   }
 
   async appendHistoryArchive(entries, options = {}) {
@@ -998,6 +1400,7 @@ export class ContextFsStorage {
     const write = async () => {
       await fs.appendFile(this.resolve("historyArchive"), payload, "utf8");
       await fs.appendFile(this.resolve("historyArchiveIndex"), indexPayload, "utf8");
+      await this.tryUpsertEmbeddingRows(normalized, "archive", { locked: true });
       return normalized;
     };
     if (options.locked) {
@@ -1026,6 +1429,8 @@ export class ContextFsStorage {
       "- history.ndjson | compactable turn history | tags: runtime,history",
       "- history.archive.ndjson | archived compacted turn history | tags: runtime,archive",
       "- history.archive.index.ndjson | archive retrieval index | tags: runtime,index",
+      "- history.embedding.hot.ndjson | hot retrieval embedding index | tags: runtime,vector,hot",
+      "- history.embedding.archive.ndjson | archive retrieval embedding index | tags: runtime,vector,archive",
       "- retrieval.traces.ndjson | retrieval trace log (derived) | tags: runtime,trace",
       "",
       "## mode",

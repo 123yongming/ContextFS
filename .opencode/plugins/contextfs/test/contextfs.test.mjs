@@ -10,6 +10,7 @@ import { mergeSummary } from "../src/summary.mjs";
 import { buildContextPack } from "../src/packer.mjs";
 import { maybeCompact } from "../src/compactor.mjs";
 import { mergeConfig } from "../src/config.mjs";
+import { hashEmbeddingText, normalizeEmbeddingText } from "../src/embedding.mjs";
 import { ContextFsStorage } from "../src/storage.mjs";
 import { runCtxCommand } from "../src/commands.mjs";
 test("estimateTokens is stable and monotonic", () => {
@@ -70,6 +71,14 @@ test("mergeConfig clamps invalid values and normalizes booleans", () => {
     autoInject: "0",
     autoCompact: "1",
     debug: "true",
+    retrievalMode: "bad",
+    vectorEnabled: "0",
+    vectorProvider: "unknown",
+    vectorDim: 2,
+    vectorTopN: 0,
+    fusionRrfK: 9999,
+    fusionCandidateMax: 0,
+    embeddingTextMaxChars: 16,
     packDelimiterStart: "XXX",
     packDelimiterEnd: "XXX",
   });
@@ -83,6 +92,14 @@ test("mergeConfig clamps invalid values and normalizes booleans", () => {
   assert.equal(cfg.autoInject, false);
   assert.equal(cfg.autoCompact, true);
   assert.equal(cfg.debug, true);
+  assert.equal(cfg.retrievalMode, "hybrid");
+  assert.equal(cfg.vectorEnabled, false);
+  assert.equal(cfg.vectorProvider, "fake");
+  assert.equal(cfg.vectorDim, 8);
+  assert.equal(cfg.vectorTopN, 1);
+  assert.equal(cfg.fusionRrfK, 500);
+  assert.equal(cfg.fusionCandidateMax, 1);
+  assert.equal(cfg.embeddingTextMaxChars, 128);
   assert.notEqual(cfg.packDelimiterStart, cfg.packDelimiterEnd);
   const huge = mergeConfig({ packDelimiterStart: "S".repeat(400), packDelimiterEnd: "E".repeat(400) });
   assert.ok(huge.packDelimiterStart.length <= 128);
@@ -138,6 +155,111 @@ test("appendHistory handles 15 concurrent writes without corrupting ndjson", asy
     for (const line of lines) {
       assert.doesNotThrow(() => JSON.parse(line));
     }
+  });
+});
+
+test("appendHistory and compaction keep embedding hot/archive indexes deduped", async () => {
+  await withTempStorage(async ({ storage, config }) => {
+    const localConfig = mergeConfig({
+      ...config,
+      recentTurns: 1,
+      tokenThreshold: 1,
+      autoCompact: true,
+      vectorEnabled: true,
+      vectorProvider: "fake",
+      retrievalMode: "hybrid",
+    });
+    storage.config = localConfig;
+
+    await storage.appendHistory({
+      role: "user",
+      text: "embedding row one",
+      ts: "2026-02-12T00:00:00.000Z",
+      session_id: "S-EMB",
+    });
+    await storage.appendHistory({
+      role: "assistant",
+      text: "embedding row two",
+      ts: "2026-02-12T00:00:01.000Z",
+      session_id: "S-EMB",
+    });
+
+    const hotBefore = await storage.readHistoryEmbeddingHot();
+    const archiveBefore = await storage.readHistoryEmbeddingArchive();
+    assert.ok(hotBefore.length >= 2);
+    assert.equal(archiveBefore.length, 0);
+    assert.ok(hotBefore.every((row) => Array.isArray(row.vec) && row.vec.length === row.dim));
+
+    await maybeCompact(storage, localConfig, true);
+    const hotAfter = await storage.readHistoryEmbeddingHot();
+    const archiveAfter = await storage.readHistoryEmbeddingArchive();
+    assert.ok(archiveAfter.length >= 1);
+    const hotIds = new Set(hotAfter.map((row) => String(row.id)));
+    const archiveIds = new Set(archiveAfter.map((row) => String(row.id)));
+    assert.equal(Array.from(hotIds).some((id) => archiveIds.has(id)), false);
+
+    await maybeCompact(storage, localConfig, true);
+    const hotAfterSecondCompact = await storage.readHistoryEmbeddingHot();
+    const archiveAfterSecondCompact = await storage.readHistoryEmbeddingArchive();
+    assert.equal(hotAfterSecondCompact.length, hotAfter.length);
+    assert.equal(archiveAfterSecondCompact.length, archiveAfter.length);
+  });
+});
+
+test("embedding hot/archive readers ignore malformed rows and archive wins on same id", async () => {
+  await withTempStorage(async ({ storage, workspaceDir }) => {
+    const hotPath = path.join(workspaceDir, ".contextfs", "history.embedding.hot.ndjson");
+    const archivePath = path.join(workspaceDir, ".contextfs", "history.embedding.archive.ndjson");
+    const hotOld = {
+      id: "H-dup",
+      ts: "2026-02-12T00:00:00.000Z",
+      source: "hot",
+      model: "fake-hot-old",
+      dim: 4,
+      text_hash: "abc",
+      vec: [1, 0, 0, 0],
+    };
+    const hotNew = {
+      id: "H-dup",
+      ts: "2026-02-12T00:00:01.000Z",
+      source: "hot",
+      model: "fake-hot-new",
+      dim: 4,
+      text_hash: "abc2",
+      vec: [0, 0, 1, 0],
+    };
+    const archiveRow = {
+      id: "H-dup",
+      ts: "2026-02-12T00:00:02.000Z",
+      source: "archive",
+      model: "fake-archive",
+      dim: 4,
+      text_hash: "def",
+      vec: [0, 1, 0, 0],
+    };
+    const archiveOnly = {
+      id: "H-archive-only",
+      ts: "2026-02-12T00:00:03.000Z",
+      source: "archive",
+      model: "fake-archive",
+      dim: 4,
+      text_hash: "ghi",
+      vec: [0, 0, 0, 1],
+    };
+    await fs.writeFile(hotPath, `${JSON.stringify(hotOld)}\nNOT_JSON\n${JSON.stringify(hotNew)}\n`, "utf8");
+    await fs.writeFile(archivePath, `${JSON.stringify(archiveRow)}\nNOT_JSON\n${JSON.stringify(archiveOnly)}\n`, "utf8");
+
+    const hotRows = await storage.readHistoryEmbeddingHot();
+    assert.equal(hotRows.length, 1);
+    assert.equal(hotRows[0].id, "H-dup");
+    assert.equal(hotRows[0].model, "fake-hot-new");
+    assert.equal(hotRows[0].source, "hot");
+
+    const rows = await storage.readHistoryEmbeddingView("all");
+    assert.equal(rows.length, 2);
+    const dedup = rows.find((item) => item.id === "H-dup");
+    assert.equal(dedup?.model, "fake-archive");
+    assert.equal(dedup?.source, "archive");
   });
 });
 
@@ -438,6 +560,79 @@ test("ctx reindex preserves raw duplicate archive ids for get/search consistency
   });
 });
 
+test("search refreshes stale embedding rows and prunes rows for empty updated text", async () => {
+  await withTempStorage(async ({ storage, config }) => {
+    const localConfig = mergeConfig({
+      ...config,
+      vectorEnabled: true,
+      vectorProvider: "fake",
+      retrievalMode: "hybrid",
+      vectorTopN: 10,
+    });
+    storage.config = localConfig;
+
+    const seed = await storage.appendHistory({
+      role: "assistant",
+      text: "initial semantic text",
+      ts: "2026-02-12T00:00:00.000Z",
+      session_id: "S-STALE",
+    });
+    assert.ok(seed?.id);
+
+    const originalTryUpsert = storage.tryUpsertEmbeddingRows.bind(storage);
+    const disableUpsertOnce = async (run) => {
+      storage.tryUpsertEmbeddingRows = async () => [];
+      try {
+        await run();
+      } finally {
+        storage.tryUpsertEmbeddingRows = originalTryUpsert;
+      }
+    };
+
+    await disableUpsertOnce(async () => {
+      await storage.updateHistoryEntryById(seed.id, {
+        text: "  refreshed vector target  ",
+      });
+    });
+
+    const expectedRefreshHash = hashEmbeddingText(
+      normalizeEmbeddingText("  refreshed vector target  ", localConfig.embeddingTextMaxChars),
+    );
+    const staleBeforeSearch = (await storage.readHistoryEmbeddingView("all")).find((row) => row.id === seed.id);
+    assert.ok(staleBeforeSearch);
+    assert.notEqual(staleBeforeSearch?.text_hash, expectedRefreshHash);
+
+    const refreshSearchOut = await runCtxCommand('ctx search "refreshed target" --k 3 --scope all', storage, localConfig);
+    assert.equal(refreshSearchOut.ok, true);
+    const refreshed = (await storage.readHistoryEmbeddingView("all")).find((row) => row.id === seed.id);
+    assert.ok(refreshed);
+    assert.equal(refreshed?.source, "hot");
+    assert.equal(refreshed?.text_hash, expectedRefreshHash);
+
+    await disableUpsertOnce(async () => {
+      await storage.updateHistoryEntryById(seed.id, {
+        text: "    ",
+      });
+    });
+
+    const staleBeforePrune = (await storage.readHistoryEmbeddingView("all")).find((row) => row.id === seed.id);
+    assert.ok(staleBeforePrune);
+
+    const pruneSearchOut = await runCtxCommand('ctx search "any" --k 3 --scope all', storage, localConfig);
+    assert.equal(pruneSearchOut.ok, true);
+    const afterPrune = (await storage.readHistoryEmbeddingView("all")).find((row) => row.id === seed.id);
+    assert.equal(afterPrune, undefined);
+  });
+});
+
+test("ctx reindex --embedding returns lexical-only guidance error", async () => {
+  await withTempStorage(async ({ storage, config }) => {
+    const out = await runCtxCommand("ctx reindex --embedding", storage, config);
+    assert.equal(out.ok, false);
+    assert.ok(out.text.includes("only rebuilds history.archive.index.ndjson"));
+  });
+});
+
 test("archive search finds semantically close cjk phrasing among many unrelated rows", async () => {
   await withTempStorage(async ({ storage, config }) => {
     const localConfig = {
@@ -675,6 +870,110 @@ test("search and timeline outputs are bounded and do not dump full text", async 
     assert.equal(timeline.ok, true);
     assert.ok(timeline.text.includes(row.id));
     assert.equal(timeline.text.includes("LONG".repeat(120)), false);
+  });
+});
+
+test("ctx search --json exposes retrieval metadata and match in hybrid mode", async () => {
+  await withTempStorage(async ({ storage, config }) => {
+    const localConfig = mergeConfig({
+      ...config,
+      retrievalMode: "hybrid",
+      vectorEnabled: true,
+      vectorProvider: "fake",
+      vectorTopN: 10,
+    });
+    storage.config = localConfig;
+
+    await storage.appendHistory({
+      role: "user",
+      text: "hybrid retrieval alpha target",
+      ts: "2026-02-09T00:00:01.000Z",
+      session_id: "S-HYBRID",
+    });
+
+    const out = await runCtxCommand('ctx search "hybrid retrieval alpha target" --k 3 --json --session S-HYBRID', storage, localConfig);
+    assert.equal(out.ok, true);
+    const parsed = JSON.parse(out.text);
+    assert.equal(parsed.layer, "L0");
+    assert.ok(parsed.retrieval);
+    assert.equal(parsed.retrieval.mode, "hybrid");
+    assert.equal(typeof parsed.retrieval.lexical_hits, "number");
+    assert.equal(typeof parsed.retrieval.vector_hits, "number");
+    assert.ok(Array.isArray(parsed.results));
+    assert.ok(parsed.results.length >= 1);
+    assert.ok(parsed.results.every((row) => ["lexical", "vector", "hybrid"].includes(String(row.match || ""))));
+  });
+});
+
+test("ctx search can return vector-only hits with custom embedding provider", async () => {
+  await withTempStorage(async ({ storage, config }) => {
+    const localConfig = mergeConfig({
+      ...config,
+      retrievalMode: "hybrid",
+      vectorEnabled: true,
+      vectorProvider: "custom",
+      vectorDim: 8,
+      vectorTopN: 5,
+    });
+    storage.config = localConfig;
+    const prevProvider = globalThis.CONTEXTFS_EMBEDDING_PROVIDER;
+    globalThis.CONTEXTFS_EMBEDDING_PROVIDER = {
+      async embedText() {
+        return {
+          model: "custom-test",
+          dim: 8,
+          vector: [1, 0, 0, 0, 0, 0, 0, 0],
+        };
+      },
+    };
+    try {
+      await storage.appendHistory({
+        role: "assistant",
+        text: "record text without keyword overlap",
+        ts: "2026-02-09T00:00:02.000Z",
+        session_id: "S-VEC",
+      });
+
+      const out = await runCtxCommand('ctx search "non-overlap-query-token" --k 3 --json --session S-VEC', storage, localConfig);
+      assert.equal(out.ok, true);
+      const parsed = JSON.parse(out.text);
+      assert.equal(parsed.retrieval.mode, "hybrid");
+      assert.equal(parsed.retrieval.lexical_hits, 0);
+      assert.ok(parsed.retrieval.vector_hits >= 1);
+      assert.ok(parsed.results.length >= 1);
+      assert.ok(parsed.results.some((row) => row.match === "vector" || row.match === "hybrid"));
+    } finally {
+      globalThis.CONTEXTFS_EMBEDDING_PROVIDER = prevProvider;
+    }
+  });
+});
+
+test("ctx search falls back to lexical when custom provider is unavailable", async () => {
+  await withTempStorage(async ({ storage, config }) => {
+    const localConfig = mergeConfig({
+      ...config,
+      retrievalMode: "hybrid",
+      vectorEnabled: true,
+      vectorProvider: "custom",
+    });
+    storage.config = localConfig;
+    const prevProvider = globalThis.CONTEXTFS_EMBEDDING_PROVIDER;
+    globalThis.CONTEXTFS_EMBEDDING_PROVIDER = undefined;
+    try {
+      await storage.appendHistory({
+        role: "user",
+        text: "lexical fallback needle",
+        ts: "2026-02-09T00:00:03.000Z",
+      });
+      const out = await runCtxCommand('ctx search "lexical fallback needle" --k 3 --json', storage, localConfig);
+      assert.equal(out.ok, true);
+      const parsed = JSON.parse(out.text);
+      assert.equal(parsed.retrieval.mode, "lexical");
+      assert.ok(typeof parsed.retrieval.fallback_reason === "string");
+      assert.ok(parsed.results.length >= 1);
+    } finally {
+      globalThis.CONTEXTFS_EMBEDDING_PROVIDER = prevProvider;
+    }
   });
 });
 

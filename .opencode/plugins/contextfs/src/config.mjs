@@ -23,6 +23,18 @@ export const DEFAULT_CONFIG = {
   tracesTailDefault: 20,
   traceRankingMaxItems: 8,
   traceQueryMaxChars: 240,
+  retrievalMode: "hybrid",
+  vectorEnabled: true,
+  vectorProvider: "fake",
+  vectorDim: 64,
+  vectorTopN: 20,
+  fusionRrfK: 60,
+  fusionCandidateMax: 100,
+  embeddingTextMaxChars: 4000,
+  embeddingAutoCompact: true,
+  embeddingHotMaxBytes: 2097152,
+  embeddingArchiveMaxBytes: 16777216,
+  embeddingDupRatioThreshold: 0.2,
   debug: false,
   packDelimiterStart: "<<<CONTEXTFS:BEGIN>>>",
   packDelimiterEnd: "<<<CONTEXTFS:END>>>",
@@ -55,6 +67,30 @@ function toBool(value, fallback) {
 function toText(value, fallback) {
   const text = String(value ?? "").trim();
   return text || fallback;
+}
+
+function clampFloat(value, fallback, min, max) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) {
+    return fallback;
+  }
+  return Math.min(max, Math.max(min, n));
+}
+
+function normalizeRetrievalMode(value, fallback) {
+  const clean = String(value ?? "").trim().toLowerCase();
+  if (clean === "lexical" || clean === "hybrid") {
+    return clean;
+  }
+  return fallback;
+}
+
+function normalizeVectorProvider(value, fallback) {
+  const clean = String(value ?? "").trim().toLowerCase();
+  if (clean === "none" || clean === "fake" || clean === "custom") {
+    return clean;
+  }
+  return fallback;
 }
 
 export function mergeConfig(userConfig = {}) {
@@ -96,6 +132,18 @@ export function mergeConfig(userConfig = {}) {
     tracesTailDefault: clampInt(merged.tracesTailDefault, DEFAULT_CONFIG.tracesTailDefault, 1, 200),
     traceRankingMaxItems: clampInt(merged.traceRankingMaxItems, DEFAULT_CONFIG.traceRankingMaxItems, 1, 50),
     traceQueryMaxChars: clampInt(merged.traceQueryMaxChars, DEFAULT_CONFIG.traceQueryMaxChars, 40, 2000),
+    retrievalMode: normalizeRetrievalMode(merged.retrievalMode, DEFAULT_CONFIG.retrievalMode),
+    vectorEnabled: toBool(merged.vectorEnabled, DEFAULT_CONFIG.vectorEnabled),
+    vectorProvider: normalizeVectorProvider(merged.vectorProvider, DEFAULT_CONFIG.vectorProvider),
+    vectorDim: clampInt(merged.vectorDim, DEFAULT_CONFIG.vectorDim, 8, 4096),
+    vectorTopN: clampInt(merged.vectorTopN, DEFAULT_CONFIG.vectorTopN, 1, 200),
+    fusionRrfK: clampInt(merged.fusionRrfK, DEFAULT_CONFIG.fusionRrfK, 1, 500),
+    fusionCandidateMax: clampInt(merged.fusionCandidateMax, DEFAULT_CONFIG.fusionCandidateMax, 1, 500),
+    embeddingTextMaxChars: clampInt(merged.embeddingTextMaxChars, DEFAULT_CONFIG.embeddingTextMaxChars, 128, 20000),
+    embeddingAutoCompact: toBool(merged.embeddingAutoCompact, DEFAULT_CONFIG.embeddingAutoCompact),
+    embeddingHotMaxBytes: clampInt(merged.embeddingHotMaxBytes, DEFAULT_CONFIG.embeddingHotMaxBytes, 4096, 500000000),
+    embeddingArchiveMaxBytes: clampInt(merged.embeddingArchiveMaxBytes, DEFAULT_CONFIG.embeddingArchiveMaxBytes, 4096, 500000000),
+    embeddingDupRatioThreshold: clampFloat(merged.embeddingDupRatioThreshold, DEFAULT_CONFIG.embeddingDupRatioThreshold, 0, 0.95),
     debug: toBool(merged.debug, DEFAULT_CONFIG.debug),
     packDelimiterStart,
     packDelimiterEnd,

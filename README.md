@@ -89,7 +89,8 @@ ContextFS 把“检索与注入”分成三层，核心目的是省 token 且可
 
 - `ctx search` 支持 `--scope all|hot|archive` 控制检索范围；支持 `--session all|current|<session-id>` 做会话隔离（默认 `all`，检索所有会话；用 `current` 仅查当前 OpenCode 会话；用具体 ID 查特定会话）。
 - `search/timeline/get/stats` 支持 `--json` 输出结构化结果。
-- `ctx search --json` / `ctx timeline --json`：返回 `layer: "L0"`，每条结果是稳定的 L0 行（`id/ts/type/summary/source/layer`），并可能包含 `score`、`expand`（提示展开 `timeline/get` 的默认窗口与粗略 token 量级）。顶层会附带 `session` 字段用于调试。
+- `ctx search --json` / `ctx timeline --json`：返回 `layer: "L0"`，每条结果是稳定的 L0 行（`id/ts/type/summary/source/layer`），并可能包含 `score`、`expand`（提示展开 `timeline/get` 的默认窗口与粗略 token 量级）。
+- `ctx search --json` 在 hybrid 模式下会附带 `retrieval`（如 `mode/lexical_hits/vector_hits/fused_hits`），并在每条结果附带 `match`（`lexical|vector|hybrid`）。
 - `ctx get --json`：返回 `layer: "L2"`，包含 `record`（完整记录，默认按 `--head` 做裁剪）与 `source`（hot|archive）。
 - `ctx stats`：文本输出会额外打印 `pack_breakdown_tokens(est)`；`--json` 会包含 `pack_breakdown`（各 section 的 token 估算）与 `session_id`。
 - `ctx save --json`：返回 `layer: "WRITE"`，包含 `action: "save_memory"` 与已写入记录的元数据（`id/ts/role/type/session_id/text_preview`）。
@@ -104,6 +105,8 @@ ContextFS 把“检索与注入”分成三层，核心目的是省 token 且可
 - `history.ndjson`: 近期严格问答对（用户原问题 + 助手最终回答）
 - `history.archive.ndjson`: 归档历史
 - `history.archive.index.ndjson`: 归档检索索引
+- `history.embedding.hot.ndjson`: 热数据向量索引
+- `history.embedding.archive.ndjson`: 归档数据向量索引
 - `retrieval.traces.ndjson`: 检索 trace（派生数据，可删可重建；可能轮转为 `retrieval.traces.N.ndjson`）
 
 ## 常见问题
@@ -112,7 +115,7 @@ ContextFS 把“检索与注入”分成三层，核心目的是省 token 且可
 不会。默认只记录用户原问题和助手最终回答。
 
 ### Q2: 历史被压缩后还能找回来吗？
-可以。归档历史仍可通过 `search` / `timeline` / `get` 检索和回放（`get` 会自动做 archive fallback；`search/timeline` 依赖 archive index）。如果 index 异常，可运行 `/ctx reindex` 重建。
+可以。归档历史仍可通过 `search` / `timeline` / `get` 检索和回放（`get` 会自动做 archive fallback；`search/timeline` 依赖 archive index）。如果 archive 词法索引异常，可运行 `/ctx reindex` 重建 `history.archive.index.ndjson`；向量索引会随写入与 compact 自动维护。
 
 ### Q3: 会影响现有项目代码吗？
 不会。插件主要读写 `.contextfs/` 和插件目录，不会侵入业务代码。
