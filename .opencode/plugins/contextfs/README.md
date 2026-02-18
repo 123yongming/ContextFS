@@ -44,6 +44,7 @@ ctx ls              # Show status
 ctx stats           # Show retrieval/pack metrics
 ctx cat <file>      # View file content
 ctx pin "..."       # Add a pin
+ctx save "..." [--title "..."] [--role assistant] [--type note] [--session current|<id>] [--json]  # Persist explicit memory
 ctx search "..." [--k 5]                 # Search lightweight index rows
 ctx timeline <id> [--before 3 --after 3]  # Show context window around id
 ctx get <id> [--head 1200]                # Fetch full row by id
@@ -54,6 +55,26 @@ ctx pack            # Show current pack
 ctx gc              # Garbage collect
 ```
 
+## MCP Server
+
+ContextFS now includes a local MCP stdio server:
+
+```bash
+node ./mcp-server.mjs --workspace <workspace-path>
+```
+
+Exposed tools:
+- `search(query, k?, scope?, session?|session_id?)`
+- `timeline(anchor_id, before?, after?, session?|session_id?)`
+- `get(id, head?, session?|session_id?)`
+- `save_memory(text, title?, role?, type?, session?|session_id?)`
+- `__IMPORTANT()`
+
+Tool payloads follow the same JSON contracts as:
+- `ctx search --json` / `ctx timeline --json` (L0 rows)
+- `ctx get --json` (L2 record with budget-aware truncation)
+- `ctx save --json` (WRITE ack with saved record metadata)
+
 ## Recommended Retrieval Workflow
 
 Use progressive retrieval to stay token-efficient:
@@ -61,6 +82,7 @@ Use progressive retrieval to stay token-efficient:
 1. `ctx search "<query>"` to get compact index rows with stable IDs
 2. `ctx timeline <id>` to inspect neighboring context
 3. `ctx get <id>` only when full detail is required
+4. `ctx save "<text>"` to persist explicit long-lived memory when needed
 
 Pack remains reference-first: retrieval index rows are included, not full detail payloads.
 
@@ -97,8 +119,9 @@ Sections (fixed order):
 ## Testing
 
 ```bash
-npm test                    # Unit tests
-npm run test:regression     # Regression tests
+npm test                    # Unit tests (core + MCP)
+node --test --test-isolation=none ./test/contextfs.mcp.test.mjs   # MCP integration tests only
+npm run test:regression     # Regression tests (repo root)
 ```
 
 ## Architecture

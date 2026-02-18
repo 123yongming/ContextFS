@@ -5,6 +5,8 @@ ContextFS 是一个给 OpenCode 用的轻量上下文管理插件，目标很简
 
 它会把会话沉淀到本地 `.contextfs/`，并在每轮对话自动注入精简且可控的上下文包。
 
+> 当前版本：v4.0.0
+
 ## 适合什么场景
 
 - 会话很长，模型开始“忘前文”
@@ -45,6 +47,7 @@ cp -r <path-to-contextfs>/.opencode/plugins/contextfs .opencode/plugins/
 
 ## 最常用用法（对话框）
 
+```text
 /ctx ls                           # 查看状态
 /ctx stats                        # 查看统计
 /ctx search "关键词" --k 5 --session current
@@ -54,8 +57,10 @@ cp -r <path-to-contextfs>/.opencode/plugins/contextfs .opencode/plugins/
 /ctx trace T-xxxxxxxxxx
 /ctx stats --json
 /ctx pin "不要修改核心架构"
+/ctx save "关键记忆文本" --title "可选标题" --session current
 /ctx compact                     # 手动触发压缩
 /ctx gc                          # 清理重复 ID
+```
 
 如果只是日常使用，优先使用 `/ctx ...`，不需要手动执行 Node 命令。
 
@@ -80,13 +85,14 @@ ContextFS 把“检索与注入”分成三层，核心目的是省 token 且可
 
 这样可以显著减少 token 浪费，同时保持信息可追溯。
 
-### 输出与字段（对齐当前分支）
+### 输出与字段（当前版本）
 
 - `ctx search` 支持 `--scope all|hot|archive` 控制检索范围；支持 `--session all|current|<session-id>` 做会话隔离（默认 `all`，检索所有会话；用 `current` 仅查当前 OpenCode 会话；用具体 ID 查特定会话）。
 - `search/timeline/get/stats` 支持 `--json` 输出结构化结果。
 - `ctx search --json` / `ctx timeline --json`：返回 `layer: "L0"`，每条结果是稳定的 L0 行（`id/ts/type/summary/source/layer`），并可能包含 `score`、`expand`（提示展开 `timeline/get` 的默认窗口与粗略 token 量级）。顶层会附带 `session` 字段用于调试。
 - `ctx get --json`：返回 `layer: "L2"`，包含 `record`（完整记录，默认按 `--head` 做裁剪）与 `source`（hot|archive）。
 - `ctx stats`：文本输出会额外打印 `pack_breakdown_tokens(est)`；`--json` 会包含 `pack_breakdown`（各 section 的 token 估算）与 `session_id`。
+- `ctx save --json`：返回 `layer: "WRITE"`，包含 `action: "save_memory"` 与已写入记录的元数据（`id/ts/role/type/session_id/text_preview`）。
 
 ## 目录说明（用户视角）
 
@@ -113,6 +119,32 @@ ContextFS 把“检索与注入”分成三层，核心目的是省 token 且可
 
 ### Q4: 还能用 CLI 吗？
 可以。CLI 主要用于脚本化或调试；日常交互建议直接在对话框使用 `/ctx ...`。
+
+## MCP Server
+
+ContextFS now provides a local MCP stdio server in:
+
+- `.opencode/plugins/contextfs/mcp-server.mjs`
+
+Run it with:
+
+```bash
+node .opencode/plugins/contextfs/mcp-server.mjs --workspace <workspace-path>
+```
+
+Exposed tools:
+
+- `search(query, k?, scope?, session?|session_id?)`
+- `timeline(anchor_id, before?, after?, session?|session_id?)`
+- `get(id, head?, session?|session_id?)`
+- `save_memory(text, title?, role?, type?, session?|session_id?)`
+- `__IMPORTANT()`
+
+Contracts:
+
+- `search/timeline` return L0 JSON (same shape as `ctx ... --json`)
+- `get` returns L2 JSON with the same `--head` budget semantics
+- `save_memory` returns WRITE JSON ack (same shape as `ctx save --json`)
 
 ## License
 
