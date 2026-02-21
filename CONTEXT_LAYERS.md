@@ -9,7 +9,7 @@ Goals:
 
 Non-goals:
 - Defining a UI.
-- Defining a vector DB schema (future work may add derived indexes, but not as source of truth).
+- Defining a source-of-truth vector DB. SQLite FTS/vec indexes are derived and rebuildable.
 
 ## Versioning Rules
 
@@ -35,6 +35,9 @@ An L0 row is an object with:
 Optional additive fields (may appear in some commands, absent in others):
 
 - `score`: number (ranking score; currently emitted by `search`)
+- `score_lex`: number (lexical channel score; emitted by `search` in hybrid-capable modes)
+- `score_vec`: number (vector channel score; emitted by `search` in hybrid-capable modes)
+- `score_final`: number (final fused/ranked score used for ordering)
 - `expand`: object (hints/budgets for progressive retrieval; currently emitted by `search`)
   - `expand.timeline`:
     - `before`: number
@@ -59,6 +62,17 @@ Top-level object:
 - `session`: `"all" | "<session-id>"`
 - `hits`: number
 - `results`: `L0Row[]`
+
+Additive `retrieval` metadata may also appear, for example:
+
+- `requested_mode`: `legacy|lexical|vector|hybrid|fallback`
+- `mode`: actual mode used after fallback
+- `lexical_engine`: `legacy|sqlite_fts5`
+- `vector_engine`: `sqlite_vec_ann|sqlite_vec_linear|null`
+- `lexical_hits`, `vector_hits`, `fused_hits`
+- `latency_ms`: `{ lexical, vector, fusion, total }`
+- `fallback_reason` / `vector_fallback_reason` / `lexical_fallback_reason` when degraded
+- optional `ann_recall_probe`: `{ probe_k, overlap, recall }`
 
 ### `ctx timeline --json` Response Schema (Stable)
 
@@ -154,4 +168,3 @@ If `--head` is too small to fit the normal JSON envelope, a tiny JSON object may
 - Keep `L0` summaries single-line and bounded.
 - Keep `L2` JSON always valid JSON under `--head` budgeting.
 - Keep pack section order stable.
-

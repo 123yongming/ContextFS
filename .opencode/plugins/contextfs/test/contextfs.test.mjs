@@ -10,9 +10,11 @@ import { mergeSummary } from "../src/summary.mjs";
 import { buildContextPack } from "../src/packer.mjs";
 import { maybeCompact } from "../src/compactor.mjs";
 import { mergeConfig } from "../src/config.mjs";
-import { hashEmbeddingText, normalizeEmbeddingText } from "../src/embedding.mjs";
+import { createEmbeddingProvider, hashEmbeddingText, normalizeEmbeddingText } from "../src/embedding.mjs";
+import { loadContextFsEnv } from "../src/env.mjs";
 import { ContextFsStorage } from "../src/storage.mjs";
 import { runCtxCommand } from "../src/commands.mjs";
+import { sqliteIndexDoctor } from "../src/index/sqlite_store.mjs";
 test("estimateTokens is stable and monotonic", () => {
   const a = estimateTokens("abcd");
   const b = estimateTokens("abcdefgh");
@@ -106,6 +108,109 @@ test("mergeConfig clamps invalid values and normalizes booleans", () => {
   assert.ok(huge.packDelimiterEnd.length <= 128);
 });
 
+test("loadContextFsEnv reads .env style file and preserves existing vars", async () => {
+  const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "contextfs-env-test-"));
+  const envPath = path.join(tmpDir, ".env");
+  await fs.writeFile(envPath, [
+    "CONTEXTFS_EMBEDDING_PROVIDER=siliconflow",
+    "CONTEXTFS_EMBEDDING_MODEL=Pro/BAAI/bge-m3",
+    "CONTEXTFS_EMBEDDING_BASE_URL=https://api.siliconflow.cn/v1",
+    "CONTEXTFS_EMBEDDING_API_KEY=from_env_file",
+  ].join("\n"), "utf8");
+  const prevApiKey = process.env.CONTEXTFS_EMBEDDING_API_KEY;
+  try {
+    process.env.CONTEXTFS_EMBEDDING_API_KEY = "already_set";
+    const loaded = await loadContextFsEnv({ path: envPath });
+    assert.equal(loaded.loaded, true);
+    assert.equal(process.env.CONTEXTFS_EMBEDDING_PROVIDER, "siliconflow");
+    assert.equal(process.env.CONTEXTFS_EMBEDDING_MODEL, "Pro/BAAI/bge-m3");
+    assert.equal(process.env.CONTEXTFS_EMBEDDING_API_KEY, "already_set");
+  } finally {
+    if (prevApiKey === undefined) {
+      delete process.env.CONTEXTFS_EMBEDDING_API_KEY;
+    } else {
+      process.env.CONTEXTFS_EMBEDDING_API_KEY = prevApiKey;
+    }
+    delete process.env.CONTEXTFS_EMBEDDING_PROVIDER;
+    delete process.env.CONTEXTFS_EMBEDDING_MODEL;
+    delete process.env.CONTEXTFS_EMBEDDING_BASE_URL;
+    await fs.rm(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test("siliconflow provider retries on 429 and returns normalized vectors", async () => {
+  const previousFetch = globalThis.fetch;
+  let calls = 0;
+  globalThis.fetch = async () => {
+    calls += 1;
+    if (calls === 1) {
+      return {
+        ok: false,
+        status: 429,
+        async text() {
+          return "rate limited";
+        },
+      };
+    }
+    return {
+      ok: true,
+      async json() {
+        return {
+          model: "Pro/BAAI/bge-m3",
+          data: [
+            { embedding: [1, 0, 0] },
+            { embedding: [0, 1, 0] },
+          ],
+        };
+      },
+    };
+  };
+  try {
+    const cfg = mergeConfig({
+      retrievalMode: "hybrid",
+      vectorEnabled: true,
+      vectorProvider: "siliconflow",
+      embeddingApiKey: "test-key",
+      embeddingModel: "Pro/BAAI/bge-m3",
+      embeddingBatchSize: 8,
+      embeddingMaxRetries: 2,
+      embeddingTimeoutMs: 5000,
+    });
+    const provider = createEmbeddingProvider(cfg);
+    const rows = await provider.embedTexts(["alpha", "beta"]);
+    assert.equal(rows.length, 2);
+    assert.equal(calls, 2);
+    assert.ok(rows.every((row) => Array.isArray(row.vector) && row.vector.length === 3));
+    assert.ok(rows.every((row) => String(row.embedding_version || "").startsWith("siliconflow:")));
+  } finally {
+    globalThis.fetch = previousFetch;
+  }
+});
+
+test("ctx search --mode lexical falls back gracefully when sqlite driver is unavailable", async () => {
+  await withTempStorage(async ({ storage, config }) => {
+    const localConfig = mergeConfig({
+      ...config,
+      indexEnabled: true,
+      retrievalMode: "lexical",
+      vectorEnabled: false,
+    });
+    storage.config = localConfig;
+    await storage.appendHistory({
+      role: "user",
+      text: "lexical sqlite fallback probe",
+      ts: "2026-02-16T00:00:00.000Z",
+    });
+    const out = await runCtxCommand('ctx search "fallback probe" --k 3 --mode lexical --json', storage, localConfig);
+    assert.equal(out.ok, true);
+    const parsed = JSON.parse(out.text);
+    assert.equal(parsed.retrieval.requested_mode, "lexical");
+    assert.ok(Array.isArray(parsed.results));
+    assert.ok(parsed.results.length >= 1);
+    assert.ok(["legacy", "sqlite_fts5"].includes(String(parsed.retrieval.lexical_engine || "")));
+  });
+});
+
 test("CONTEXT_LAYERS.md documents stable L0/L1/L2 contracts", async () => {
   const docUrl = new URL("../../../../CONTEXT_LAYERS.md", import.meta.url);
   const raw = await fs.readFile(docUrl, "utf8");
@@ -130,6 +235,281 @@ async function withTempStorage(run) {
     await fs.rm(workspaceDir, { recursive: true, force: true });
   }
 }
+
+async function hasSqliteDriver() {
+  try {
+    await import("better-sqlite3");
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function fileExists(targetPath) {
+  try {
+    await fs.access(targetPath);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+test("ensureInitialized creates index.sqlite when sqlite driver is available", async (t) => {
+  if (!(await hasSqliteDriver())) {
+    t.skip("better-sqlite3 unavailable in this environment");
+    return;
+  }
+  await withTempStorage(async ({ workspaceDir }) => {
+    const sqlitePath = path.join(workspaceDir, ".contextfs", "index.sqlite");
+    assert.equal(await fileExists(sqlitePath), true);
+  });
+});
+
+test("ensureInitialized backfills empty sqlite index from existing history without reindex", async (t) => {
+  if (!(await hasSqliteDriver())) {
+    t.skip("better-sqlite3 unavailable in this environment");
+    return;
+  }
+
+  const workspaceDir = await fs.mkdtemp(path.join(os.tmpdir(), "contextfs-bootstrap-test-"));
+  const config = mergeConfig({
+    contextfsDir: ".contextfs",
+    indexEnabled: true,
+    vectorEnabled: false,
+  });
+  const baseDir = path.join(workspaceDir, ".contextfs");
+  const historyPath = path.join(baseDir, "history.ndjson");
+  const archivePath = path.join(baseDir, "history.archive.ndjson");
+  const storage = new ContextFsStorage(workspaceDir, config);
+
+  try {
+    await fs.mkdir(baseDir, { recursive: true });
+    await fs.writeFile(historyPath, [
+      JSON.stringify({
+        id: "H-hot-1",
+        ts: "2026-02-20T00:00:00.000Z",
+        role: "user",
+        type: "query",
+        refs: [],
+        text: "hot turn before bootstrap",
+      }),
+      "",
+    ].join("\n"), "utf8");
+    await fs.writeFile(archivePath, [
+      JSON.stringify({
+        id: "H-archive-1",
+        ts: "2026-02-19T23:59:59.000Z",
+        role: "assistant",
+        type: "response",
+        refs: [],
+        text: "archive turn before bootstrap",
+      }),
+      "",
+    ].join("\n"), "utf8");
+
+    await storage.ensureInitialized();
+    const doctor = await sqliteIndexDoctor(workspaceDir, config);
+    assert.equal(doctor.available, true);
+    assert.ok(Number(doctor.turns || 0) >= 2);
+  } finally {
+    await fs.rm(workspaceDir, { recursive: true, force: true });
+  }
+});
+
+test("appendHistory writes sqlite index incrementally without reindex", async (t) => {
+  if (!(await hasSqliteDriver())) {
+    t.skip("better-sqlite3 unavailable in this environment");
+    return;
+  }
+  await withTempStorage(async ({ storage, workspaceDir, config }) => {
+    await storage.appendHistory({
+      role: "user",
+      text: "incremental sqlite write one",
+      ts: "2026-02-20T00:00:00.000Z",
+    });
+    await storage.appendHistory({
+      role: "assistant",
+      text: "incremental sqlite write two",
+      ts: "2026-02-20T00:00:01.000Z",
+    });
+    const doctor = await sqliteIndexDoctor(workspaceDir, config);
+    assert.equal(doctor.available, true);
+    assert.ok(Number(doctor.turns || 0) >= 2);
+  });
+});
+
+test("appendHistory keeps ndjson when sqlite upsert fails", async () => {
+  await withTempStorage(async ({ storage }) => {
+    const before = await storage.readHistory();
+    const original = storage.tryUpsertSqliteRows;
+    storage.tryUpsertSqliteRows = async () => {
+      return { upserted: 0, available: false, reason: "forced_sqlite_failure" };
+    };
+    try {
+      const saved = await storage.appendHistory({
+        role: "user",
+        text: "ndjson should persist on sqlite failure",
+        ts: "2026-02-20T00:00:02.000Z",
+      });
+      assert.ok(saved);
+    } finally {
+      storage.tryUpsertSqliteRows = original;
+    }
+    const after = await storage.readHistory();
+    assert.equal(after.length, before.length + 1);
+    assert.equal(after.some((item) => String(item.text || "").includes("ndjson should persist on sqlite failure")), true);
+  });
+});
+
+test("updateHistoryEntryById keeps ndjson update when sqlite upsert fails", async () => {
+  await withTempStorage(async ({ storage }) => {
+    await storage.appendHistory({
+      role: "assistant",
+      text: "original stable text",
+      ts: "2026-02-20T00:00:03.000Z",
+    });
+    const history = await storage.readHistory();
+    const target = history[0];
+    const original = storage.tryUpsertSqliteRows;
+    storage.tryUpsertSqliteRows = async () => {
+      return { upserted: 0, available: false, reason: "forced_sqlite_failure" };
+    };
+    try {
+      const updated = await storage.updateHistoryEntryById(target.id, {
+        text: "mutated text should persist",
+      });
+      assert.ok(updated);
+    } finally {
+      storage.tryUpsertSqliteRows = original;
+    }
+    const after = await storage.readHistory();
+    const persisted = after.find((item) => String(item.id) === String(target.id));
+    assert.ok(persisted);
+    assert.equal(persisted.text, "mutated text should persist");
+  });
+});
+
+test("appendHistoryArchive keeps archive ndjson when sqlite upsert fails", async () => {
+  await withTempStorage(async ({ storage }) => {
+    const archiveBefore = await storage.readHistoryArchive();
+    const original = storage.tryUpsertSqliteRows;
+    storage.tryUpsertSqliteRows = async () => {
+      return { upserted: 0, available: false, reason: "forced_sqlite_failure" };
+    };
+    try {
+      const appended = await storage.appendHistoryArchive([
+        {
+          role: "user",
+          text: "archive ndjson should persist on sqlite failure",
+          ts: "2026-02-20T00:00:04.000Z",
+        },
+      ]);
+      assert.equal(appended.length, 1);
+    } finally {
+      storage.tryUpsertSqliteRows = original;
+    }
+    const archiveAfter = await storage.readHistoryArchive();
+    assert.equal(archiveAfter.length, archiveBefore.length + 1);
+    assert.equal(archiveAfter.some((item) => String(item.text || "").includes("archive ndjson should persist on sqlite failure")), true);
+  });
+});
+
+test("ensureInitialized auto-recovers sqlite vector table from embedding index without reindex", async (t) => {
+  if (!(await hasSqliteDriver())) {
+    t.skip("better-sqlite3 unavailable in this environment");
+    return;
+  }
+  await withTempStorage(async ({ storage, workspaceDir, config }) => {
+    const localConfig = mergeConfig({
+      ...config,
+      indexEnabled: true,
+      retrievalMode: "hybrid",
+      vectorEnabled: true,
+      vectorProvider: "fake",
+    });
+    storage.config = localConfig;
+
+    await storage.appendHistory({
+      role: "user",
+      text: "vector recover user",
+      ts: "2026-02-20T00:00:00.000Z",
+    });
+    await storage.appendHistory({
+      role: "assistant",
+      text: "vector recover assistant",
+      ts: "2026-02-20T00:00:01.000Z",
+    });
+
+    const before = await sqliteIndexDoctor(workspaceDir, localConfig);
+    if (!before.vector?.available) {
+      t.skip("sqlite-vec unavailable in this environment");
+      return;
+    }
+    assert.ok(Number(before.vector.rows || 0) >= 2);
+
+    const sqlitePath = path.join(workspaceDir, ".contextfs", "index.sqlite");
+    const walPath = `${sqlitePath}-wal`;
+    const shmPath = `${sqlitePath}-shm`;
+    await fs.rm(sqlitePath, { force: true });
+    await fs.rm(walPath, { force: true });
+    await fs.rm(shmPath, { force: true });
+
+    await storage.ensureInitialized();
+    const after = await sqliteIndexDoctor(workspaceDir, localConfig);
+    assert.equal(after.available, true);
+    assert.equal(after.vector?.available, true);
+    assert.ok(Number(after.vector?.rows || 0) >= 2);
+  });
+});
+
+test("ensureInitialized backfills sqlite turns when index lags behind history", async (t) => {
+  if (!(await hasSqliteDriver())) {
+    t.skip("better-sqlite3 unavailable in this environment");
+    return;
+  }
+  await withTempStorage(async ({ storage, workspaceDir, config }) => {
+    const localConfig = mergeConfig({
+      ...config,
+      indexEnabled: true,
+      retrievalMode: "hybrid",
+      vectorEnabled: true,
+      vectorProvider: "fake",
+    });
+    storage.config = localConfig;
+
+    for (let i = 0; i < 5; i += 1) {
+      await storage.appendHistory({
+        role: i % 2 ? "assistant" : "user",
+        text: `sqlite lag row ${i}`,
+        ts: `2026-02-20T00:00:0${i}.000Z`,
+      });
+    }
+
+    const before = await sqliteIndexDoctor(workspaceDir, localConfig);
+    assert.equal(before.available, true);
+    assert.ok(Number(before.turns || 0) >= 5);
+
+    const mod = await import("better-sqlite3");
+    const Driver = mod.default || mod;
+    const db = new Driver(path.join(workspaceDir, ".contextfs", "index.sqlite"));
+    try {
+      db.exec("DELETE FROM turns WHERE id IN (SELECT id FROM turns ORDER BY ts DESC LIMIT 2)");
+      db.exec("DELETE FROM turns_fts WHERE id NOT IN (SELECT id FROM turns)");
+    } finally {
+      db.close();
+    }
+
+    const lagged = await sqliteIndexDoctor(workspaceDir, localConfig);
+    assert.equal(lagged.available, true);
+    assert.ok(Number(lagged.turns || 0) < 5);
+
+    await storage.ensureInitialized();
+    const healed = await sqliteIndexDoctor(workspaceDir, localConfig);
+    assert.equal(healed.available, true);
+    assert.ok(Number(healed.turns || 0) >= 5);
+    assert.equal(Number(healed.turns || 0), Number(healed.turns_fts || -1));
+  });
+});
 
 test("appendHistory handles 15 concurrent writes without corrupting ndjson", async () => {
   await withTempStorage(async ({ storage, workspaceDir }) => {
@@ -427,7 +807,7 @@ test("maybeCompact does not lose concurrent append", async () => {
 });
 
 test("compacted turns remain retrievable via archive fallback", async () => {
-  await withTempStorage(async ({ storage, config }) => {
+  await withTempStorage(async ({ storage, config, workspaceDir }) => {
     const localConfig = {
       ...config,
       recentTurns: 2,
@@ -449,10 +829,10 @@ test("compacted turns remain retrievable via archive fallback", async () => {
 
     const hot = await storage.readHistory();
     const archive = await storage.readHistoryArchive();
-    const archiveIndex = await storage.readHistoryArchiveIndex();
+    const indexPath = path.join(workspaceDir, ".contextfs", "history.archive.index.ndjson");
     assert.equal(hot.some((item) => item.id === archivedId), false);
     assert.equal(archive.some((item) => item.id === archivedId), true);
-    assert.equal(archiveIndex.some((item) => item.id === archivedId), true);
+    await assert.rejects(fs.access(indexPath));
 
     const getOut = await runCtxCommand(`ctx get ${archivedId}`, storage, localConfig);
     assert.equal(getOut.ok, true);
@@ -474,7 +854,7 @@ test("compacted turns remain retrievable via archive fallback", async () => {
   });
 });
 
-test("ctx reindex rebuilds archive index and preserves archive search/timeline", async () => {
+test("ctx reindex skips archive index rebuild and archive search/timeline read archive rows", async () => {
   await withTempStorage(async ({ storage, workspaceDir, config }) => {
     const localConfig = {
       ...config,
@@ -496,12 +876,14 @@ test("ctx reindex rebuilds archive index and preserves archive search/timeline",
     const indexPath = path.join(workspaceDir, ".contextfs", "history.archive.index.ndjson");
     await fs.writeFile(indexPath, "{\"id\":\"BROKEN\",\"summary\":\"bad\"}\n", "utf8");
 
-    const reindexOut = await runCtxCommand("ctx reindex", storage, localConfig);
+    const reindexOut = await runCtxCommand("ctx reindex --full", storage, localConfig);
     assert.equal(reindexOut.ok, true);
     assert.ok(reindexOut.text.includes("reindex done"));
-
-    const index = await storage.readHistoryArchiveIndex();
-    assert.equal(index.some((item) => item.id === targetId), true);
+    assert.equal(reindexOut.text.includes("archive.rebuilt"), false);
+    assert.equal(reindexOut.text.includes("archive.entries"), false);
+    assert.equal(reindexOut.text.includes("archive.index_entries"), false);
+    const poisoned = await fs.readFile(indexPath, "utf8");
+    assert.ok(poisoned.includes("BROKEN"));
 
     const searchOut = await runCtxCommand('ctx search "reindex-target-1" --k 3 --scope archive', storage, localConfig);
     assert.equal(searchOut.ok, true);
@@ -536,9 +918,6 @@ test("ctx reindex preserves raw duplicate archive ids for get/search consistency
 
     const reindexOut = await runCtxCommand("ctx reindex", storage, config);
     assert.equal(reindexOut.ok, true);
-
-    const indexRaw = await storage.readText("historyArchiveIndex");
-    assert.equal(indexRaw.includes("H-dup-1"), false);
 
     const search = await runCtxCommand('ctx search "duplicate" --scope archive --k 10 --json', storage, config);
     assert.equal(search.ok, true);
@@ -616,7 +995,7 @@ test("search refreshes stale embedding rows and prunes rows for empty updated te
     });
 
     const staleBeforePrune = (await storage.readHistoryEmbeddingView("all")).find((row) => row.id === seed.id);
-    assert.ok(staleBeforePrune);
+    assert.equal(staleBeforePrune, undefined);
 
     const pruneSearchOut = await runCtxCommand('ctx search "any" --k 3 --scope all', storage, localConfig);
     assert.equal(pruneSearchOut.ok, true);
@@ -629,7 +1008,7 @@ test("ctx reindex --embedding returns lexical-only guidance error", async () => 
   await withTempStorage(async ({ storage, config }) => {
     const out = await runCtxCommand("ctx reindex --embedding", storage, config);
     assert.equal(out.ok, false);
-    assert.ok(out.text.includes("only rebuilds history.archive.index.ndjson"));
+    assert.ok(out.text.includes("ctx reindex --vectors rebuilds SQLite vector index"));
   });
 });
 
@@ -737,7 +1116,7 @@ test("ctx search --session excludes legacy rows without session_id", async () =>
   });
 });
 
-test("archive search --session filters archive index rows by session_id", async () => {
+test("archive search --session filters archive rows by session_id", async () => {
   await withTempStorage(async ({ storage, config }) => {
     const localConfig = {
       ...config,
@@ -937,11 +1316,95 @@ test("ctx search can return vector-only hits with custom embedding provider", as
       const out = await runCtxCommand('ctx search "non-overlap-query-token" --k 3 --json --session S-VEC', storage, localConfig);
       assert.equal(out.ok, true);
       const parsed = JSON.parse(out.text);
-      assert.equal(parsed.retrieval.mode, "hybrid");
+      assert.ok(["hybrid", "vector"].includes(String(parsed.retrieval.mode || "")));
       assert.equal(parsed.retrieval.lexical_hits, 0);
       assert.ok(parsed.retrieval.vector_hits >= 1);
+      assert.ok(["sqlite_vec_ann", "sqlite_vec_linear"].includes(String(parsed.retrieval.vector_engine || "")));
       assert.ok(parsed.results.length >= 1);
       assert.ok(parsed.results.some((row) => row.match === "vector" || row.match === "hybrid"));
+    } finally {
+      globalThis.CONTEXTFS_EMBEDDING_PROVIDER = prevProvider;
+    }
+  });
+});
+
+test("ctx search uses sqlite linear vector path when ANN is disabled", async () => {
+  await withTempStorage(async ({ storage, config }) => {
+    const localConfig = mergeConfig({
+      ...config,
+      retrievalMode: "hybrid",
+      vectorEnabled: true,
+      vectorProvider: "custom",
+      vectorDim: 8,
+      vectorTopN: 5,
+      annEnabled: false,
+    });
+    storage.config = localConfig;
+    const prevProvider = globalThis.CONTEXTFS_EMBEDDING_PROVIDER;
+    globalThis.CONTEXTFS_EMBEDDING_PROVIDER = {
+      async embedText() {
+        return {
+          model: "custom-test",
+          dim: 8,
+          vector: [1, 0, 0, 0, 0, 0, 0, 0],
+        };
+      },
+    };
+    try {
+      await storage.appendHistory({
+        role: "assistant",
+        text: "linear fallback anchor",
+        ts: "2026-02-09T00:00:02.000Z",
+        session_id: "S-LINEAR",
+      });
+      const out = await runCtxCommand('ctx search "completely different lexical query" --k 3 --json --session S-LINEAR', storage, localConfig);
+      assert.equal(out.ok, true);
+      const parsed = JSON.parse(out.text);
+      assert.ok(parsed.retrieval.vector_hits >= 1);
+      assert.equal(parsed.retrieval.vector_engine, "sqlite_vec_linear");
+      assert.ok(["hybrid", "vector"].includes(String(parsed.retrieval.mode || "")));
+    } finally {
+      globalThis.CONTEXTFS_EMBEDDING_PROVIDER = prevProvider;
+    }
+  });
+});
+
+test("sqlite vector upsert reports version mismatch without crashing", async () => {
+  await withTempStorage(async ({ storage, config }) => {
+    const localConfig = mergeConfig({
+      ...config,
+      retrievalMode: "hybrid",
+      vectorEnabled: true,
+      vectorProvider: "custom",
+      vectorDim: 8,
+    });
+    storage.config = localConfig;
+    const prevProvider = globalThis.CONTEXTFS_EMBEDDING_PROVIDER;
+    globalThis.CONTEXTFS_EMBEDDING_PROVIDER = {
+      async embedText() {
+        return {
+          model: "custom-test",
+          dim: 8,
+          vector: [1, 0, 0, 0, 0, 0, 0, 0],
+        };
+      },
+    };
+    try {
+      await storage.appendHistory({
+        role: "assistant",
+        text: "mismatch probe row",
+        ts: "2026-02-09T00:00:02.000Z",
+      });
+      const rows = await storage.readHistoryEmbeddingView("all");
+      const mismatch = await storage.tryUpsertSqliteVectorRows(rows, {
+        provider: "custom",
+        model: "different-model",
+        dim: 8,
+        embedding_version: "custom:different-model:8:unit",
+      });
+      assert.equal(mismatch.available, true);
+      assert.equal(mismatch.upserted, 0);
+      assert.equal(mismatch.reason, "version_mismatch");
     } finally {
       globalThis.CONTEXTFS_EMBEDDING_PROVIDER = prevProvider;
     }
@@ -1149,6 +1612,52 @@ test("ctx stats --json includes pack_breakdown with section token estimates", as
       assert.ok(b[key] >= 0);
     }
     assert.equal(b.total_tokens, parsed.estimated_tokens);
+  });
+});
+
+test("ctx metrics and ctx doctor expose structured diagnostics", async () => {
+  await withTempStorage(async ({ storage, config }) => {
+    await storage.appendHistory({ role: "user", text: "metrics doctor sample", ts: "2026-02-09T00:04:10.000Z" });
+    await runCtxCommand('ctx search "metrics doctor" --k 3 --json', storage, config);
+
+    const metricsOut = await runCtxCommand("ctx metrics --json", storage, config);
+    assert.equal(metricsOut.ok, true);
+    const metrics = JSON.parse(metricsOut.text);
+    assert.equal(metrics.layer, "METRICS");
+    assert.equal(typeof metrics.counters.search_count, "number");
+    assert.ok(Object.prototype.hasOwnProperty.call(metrics, "vector_engine"));
+
+    const doctorOut = await runCtxCommand("ctx doctor --json", storage, config);
+    assert.equal(doctorOut.ok, true);
+    const doctor = JSON.parse(doctorOut.text);
+    assert.equal(doctor.layer, "DOCTOR");
+    assert.ok(doctor.sqlite_index);
+    assert.ok(doctor.sqlite_index.vector);
+    assert.equal(typeof doctor.sqlite_index.vector.rows, "number");
+    assert.ok(doctor.embedding);
+  });
+});
+
+test("ctx reindex supports --full and --vectors", async () => {
+  await withTempStorage(async ({ storage, config }) => {
+    const localConfig = mergeConfig({
+      ...config,
+      indexEnabled: true,
+      retrievalMode: "hybrid",
+      vectorEnabled: true,
+      vectorProvider: "fake",
+    });
+    storage.config = localConfig;
+    await storage.appendHistory({ role: "user", text: "reindex sample one", ts: "2026-02-09T00:04:20.000Z" });
+    await storage.appendHistory({ role: "assistant", text: "reindex sample two", ts: "2026-02-09T00:04:21.000Z" });
+
+    const out = await runCtxCommand("ctx reindex --full --vectors", storage, localConfig);
+    assert.equal(out.ok, true);
+    assert.ok(out.text.includes("reindex done"));
+    assert.equal(out.text.includes("archive.rebuilt"), false);
+    assert.ok(out.text.includes("vectors.rebuilt"));
+    assert.ok(out.text.includes("vectors.dim"));
+    assert.ok(out.text.includes("vectors.sqlite_available"));
   });
 });
 

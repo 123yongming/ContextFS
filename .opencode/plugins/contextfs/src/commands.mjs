@@ -4,7 +4,15 @@ import { fileMap } from "./storage.mjs";
 import { addPin, parsePinsMarkdown } from "./pins.mjs";
 import { maybeCompact } from "./compactor.mjs";
 import { buildContextPack } from "./packer.mjs";
-import { cosineSimilarity, createEmbeddingProvider, hashEmbeddingText, normalizeEmbeddingText } from "./embedding.mjs";
+import { createEmbeddingProvider, embedTexts, hashEmbeddingText, normalizeEmbeddingText } from "./embedding.mjs";
+import {
+  rebuildSqliteIndexFromStorage,
+  rebuildSqliteVectorIndexFromStorage,
+  searchSqliteLexical,
+  searchSqliteVectorAnn,
+  searchSqliteVectorLinear,
+  sqliteIndexDoctor,
+} from "./index/sqlite_store.mjs";
 import { estimateTokens } from "./token.mjs";
 
 function parseArgs(raw) {
@@ -381,7 +389,7 @@ function asArchiveSearchRows(items) {
     type: item.type || "note",
     session_id: item.session_id,
     refs: Array.isArray(item.refs) ? item.refs : [],
-    text: String(item.summary || item.text || ""),
+    text: String(item.text || item.summary || ""),
     source: "archive",
   }));
 }
@@ -392,10 +400,10 @@ async function readHistoryByScope(storage, scope = "all") {
     return { history: await storage.readHistory(), archive: [] };
   }
   if (normalized === "archive") {
-    return { history: [], archive: asArchiveSearchRows(await storage.readHistoryArchiveIndex()) };
+    return { history: [], archive: asArchiveSearchRows(await storage.readHistoryArchive()) };
   }
   const history = await storage.readHistory();
-  const archive = asArchiveSearchRows(await storage.readHistoryArchiveIndex());
+  const archive = asArchiveSearchRows(await storage.readHistoryArchive());
   return { history, archive };
 }
 
@@ -411,6 +419,14 @@ function shouldUseHybridRetrieval(config) {
   return normalizeRetrievalMode(config) === "hybrid" && Boolean(config?.vectorEnabled);
 }
 
+function normalizeSearchMode(input, fallback = "fallback") {
+  const mode = String(input || "").trim().toLowerCase();
+  if (mode === "legacy" || mode === "lexical" || mode === "vector" || mode === "hybrid" || mode === "fallback") {
+    return mode;
+  }
+  return fallback;
+}
+
 function rrfScore(rank, k) {
   const safeRank = Number(rank);
   if (!Number.isFinite(safeRank) || safeRank <= 0) {
@@ -421,6 +437,52 @@ function rrfScore(rank, k) {
 
 function sourceForId(id, hotIds) {
   return hotIds.has(String(id)) ? "hot" : "archive";
+}
+
+function parseEmbeddingVersion(value) {
+  const clean = String(value || "").trim();
+  if (!clean) {
+    return null;
+  }
+  const parts = clean.split(":");
+  if (parts.length < 4) {
+    return null;
+  }
+  const provider = String(parts[0] || "").trim();
+  const normalize = String(parts[parts.length - 1] || "").trim() || "unit";
+  const dimRaw = Number(parts[parts.length - 2]);
+  const dim = Number.isFinite(dimRaw) && dimRaw > 0 ? Math.floor(dimRaw) : 0;
+  const model = String(parts.slice(1, parts.length - 2).join(":") || "").trim();
+  return {
+    provider,
+    model,
+    dim,
+    normalize,
+  };
+}
+
+function buildVectorMetaFromRows(rows, fallback = {}) {
+  const list = Array.isArray(rows) ? rows : [];
+  const first = list.find((row) => Array.isArray(row?.vec) && row.vec.length) || null;
+  if (!first) {
+    return null;
+  }
+  const embeddedVersion = String(first.embedding_version || "").trim();
+  const parsed = parseEmbeddingVersion(embeddedVersion);
+  const provider = String(parsed?.provider || fallback.provider || "").trim();
+  const model = String(parsed?.model || first.model || fallback.model || "").trim();
+  const dim = Number(fallback.dim) > 0
+    ? Math.floor(Number(fallback.dim))
+    : (Number(parsed?.dim) > 0 ? Number(parsed.dim) : Number(first.dim || first.vec.length || 0));
+  if (!dim) {
+    return null;
+  }
+  return {
+    provider: provider || "unknown",
+    model: model || "unknown",
+    dim,
+    embedding_version: embeddedVersion || `${provider || "unknown"}:${model || "unknown"}:${dim}:unit`,
+  };
 }
 
 async function ensureVectorRows(storage, provider, entries, hotIds, config) {
@@ -447,9 +509,21 @@ async function ensureVectorRows(storage, provider, entries, hotIds, config) {
     const hasVector = Boolean(existing && Array.isArray(existing.vec) && existing.vec.length);
     const hashMatches = String(existing?.text_hash || "") === expectedHash;
     const sourceMatches = String(existing?.source || "") === expectedSource;
-    const dimMatches = Number(existing?.dim || 0) === Number(provider?.dim || 0);
-    const modelMatches = String(existing?.model || "") === String(provider?.model || "");
-    if (!hasVector || !hashMatches || !sourceMatches || !dimMatches || !modelMatches) {
+    const providerDim = Number(provider?.dim || 0);
+    const dimMatches = Boolean(provider?.dynamicDim) || providerDim <= 0 || Number(existing?.dim || 0) === providerDim;
+    const providerName = String(provider?.name || "unknown");
+    const providerModel = String(provider?.model || "");
+    const modelMatches = String(existing?.model || "") === providerModel;
+    const existingVersion = String(existing?.embedding_version || "");
+    const parsedVersion = parseEmbeddingVersion(existingVersion);
+    const versionMatches = !existingVersion.trim()
+      || (
+        parsedVersion
+        && String(parsedVersion.provider || "") === providerName
+        && String(parsedVersion.model || "") === providerModel
+        && (Boolean(provider?.dynamicDim) || providerDim <= 0 || Number(parsedVersion.dim || 0) === providerDim)
+      );
+    if (!hasVector || !hashMatches || !sourceMatches || !dimMatches || !modelMatches || !versionMatches) {
       staleIds.add(id);
       byId.delete(id);
       missingEntries.push({
@@ -460,17 +534,23 @@ async function ensureVectorRows(storage, provider, entries, hotIds, config) {
     }
   }
   if (staleIds.size) {
-    await storage.pruneHistoryEmbeddingByIds(Array.from(staleIds));
+    const staleList = Array.from(staleIds);
+    await storage.pruneHistoryEmbeddingByIds(staleList);
+    await storage.tryPruneSqliteVectorRowsByIds(staleList);
   }
   if (!missingEntries.length) {
     return byId;
   }
+  const embeddedRows = await embedTexts(provider, missingEntries.map((item) => String(item.text || "")), {
+    batchSize: config.embeddingBatchSize,
+  });
   const appended = [];
-  for (const item of missingEntries) {
+  for (let i = 0; i < missingEntries.length; i += 1) {
+    const item = missingEntries[i];
     const entry = item.entry;
     const text = String(item.text || "");
     const expectedHash = hashEmbeddingText(text);
-    const embedded = await provider.embedText(text);
+    const embedded = embeddedRows[i];
     const vector = Array.isArray(embedded?.vector) ? embedded.vector : [];
     if (!vector.length) {
       continue;
@@ -483,6 +563,7 @@ async function ensureVectorRows(storage, provider, entries, hotIds, config) {
       model: String(embedded.model || provider.model || "unknown"),
       dim: Number(embedded.dim) || vector.length,
       text_hash: String(embedded.text_hash || expectedHash),
+      embedding_version: String(embedded.embedding_version || `${provider?.name || "unknown"}:${embedded?.model || provider?.model || "unknown"}:${Number(embedded?.dim || vector.length) || 0}:unit`),
       vec: vector,
     });
   }
@@ -490,10 +571,69 @@ async function ensureVectorRows(storage, provider, entries, hotIds, config) {
     return byId;
   }
   const written = await storage.appendHistoryEmbeddingRows(appended);
+  await storage.tryUpsertSqliteVectorRows(written, buildVectorMetaFromRows(written, {
+    provider: provider?.name,
+    model: provider?.model,
+  }) || {});
   for (const row of written) {
     byId.set(String(row.id), row);
   }
   return byId;
+}
+
+async function rebuildVectorRows(storage, config, modelOverride = "") {
+  const localConfig = {
+    ...config,
+    retrievalMode: "hybrid",
+    vectorEnabled: true,
+    ...(modelOverride
+      ? {
+        embeddingModel: String(modelOverride || "").trim(),
+      }
+      : {}),
+  };
+  const provider = createEmbeddingProvider(localConfig);
+  if (!provider.enabled) {
+    return {
+      rebuilt: false,
+      reason: "vector retrieval disabled",
+      provider: provider.name,
+      model: provider.model,
+      vectors: 0,
+    };
+  }
+  const history = await storage.readHistory();
+  const archiveRows = await storage.readHistoryArchive();
+  const merged = mergeUniqueHistory(history, archiveRows);
+  const hotIds = new Set(history.map((item) => String(item.id)));
+  const existing = await storage.readHistoryEmbeddingView("all");
+  if (existing.length) {
+    await storage.pruneHistoryEmbeddingByIds(existing.map((row) => String(row.id)));
+    await storage.tryPruneSqliteVectorRowsByIds(existing.map((row) => String(row.id)));
+  }
+  const byId = await ensureVectorRows(storage, provider, merged, hotIds, localConfig);
+  const vectorRows = Array.from(byId.values());
+  const sqliteResult = await rebuildSqliteVectorIndexFromStorage(storage, localConfig, {
+    rows: vectorRows,
+    provider: provider.name,
+    model: provider.model,
+    embedding_version: buildVectorMetaFromRows(vectorRows, {
+      provider: provider.name,
+      model: provider.model,
+    })?.embedding_version || "",
+  });
+  return {
+    rebuilt: Boolean(sqliteResult?.rebuilt),
+    reason: String(sqliteResult?.reason || ""),
+    provider: provider.name,
+    model: provider.model,
+    vectors: Number(sqliteResult?.vectors || sqliteResult?.upserted || byId.size),
+    entries: merged.length,
+    sqlite_available: Boolean(sqliteResult?.available),
+    sqlite_reason: String(sqliteResult?.reason || ""),
+    dim: Number(sqliteResult?.dim || 0),
+    embedding_version: String(sqliteResult?.embedding_version || ""),
+  };
 }
 
 function safeFileName(name) {
@@ -509,7 +649,6 @@ function safeFileName(name) {
     "history",
     "history.ndjson",
     "history.archive.ndjson",
-    "history.archive.index.ndjson",
     "history.embedding.hot.ndjson",
     "history.embedding.archive.ndjson",
   ]);
@@ -545,14 +684,16 @@ export async function runCtxCommandArgs(rawArgv, storage, config) {
         "  ctx pin \"<text>\"",
         "  ctx save \"<text>\" [--title \"...\"] [--role user|assistant|system|tool|note|unknown] [--type note] [--session current|<id>] [--json]",
         "  ctx compact",
-        "  ctx search \"<query>\" [--k 5] [--scope all|hot|archive] [--session all|current|<id>]",
+        "  ctx search \"<query>\" [--k 5] [--scope all|hot|archive] [--mode legacy|lexical|vector|hybrid|fallback] [--session all|current|<id>]",
         "  ctx timeline <id> [--before 3 --after 3] [--session all|current|<id>]",
         "  ctx get <id> [--head 1200] [--session all|current|<id>]",
         "  ctx traces [--tail 20] [--json]",
         "  ctx trace <trace_id> [--json]",
         "  ctx stats",
+        "  ctx metrics [--json]",
+        "  ctx doctor [--json]",
         "  ctx gc",
-        "  ctx reindex",
+        "  ctx reindex [--full] [--vectors] [--model <name>]",
       ].join("\n"),
     );
   }
@@ -630,6 +771,111 @@ export async function runCtxCommandArgs(rawArgv, storage, config) {
         `timeline_count: ${payload.timeline_count}`,
         `get_count: ${payload.get_count}`,
         `stats_count: ${payload.stats_count}`,
+      ].join("\n"),
+    );
+  }
+
+  if (cmd === "metrics") {
+    const asJson = hasFlag(args, "--json");
+    const state = await storage.readState();
+    const traces = await storage.readRetrievalTraces({ tail: 1, config });
+    const latestTrace = traces.length ? traces[traces.length - 1] : null;
+    const retrieval = latestTrace?.inputs?.retrieval || null;
+    const payload = {
+      layer: "METRICS",
+      counters: {
+        search_count: state.searchCount || 0,
+        timeline_count: state.timelineCount || 0,
+        get_count: state.getCount || 0,
+        stats_count: state.statsCount || 0,
+      },
+      last_search: {
+        hits: state.lastSearchHits || 0,
+        query: String(state.lastSearchQuery || ""),
+        at: state.lastSearchAt || null,
+      },
+      retrieval_latency_ms: retrieval?.latency_ms || null,
+      retrieval_mode: retrieval?.mode || null,
+      vector_hits: Number(retrieval?.vector_hits || 0),
+      vector_engine: retrieval?.vector_engine || null,
+      fallback_reason: String(
+        retrieval?.vector_fallback_reason
+        || retrieval?.fallback_reason
+        || retrieval?.lexical_fallback_reason
+        || "",
+      ),
+      ann_recall_probe: retrieval?.ann_recall_probe || null,
+    };
+    const jsonOut = jsonOrText(payload, asJson);
+    if (jsonOut) {
+      return jsonOut;
+    }
+    return textResult(
+      [
+        "# ctx metrics",
+        `search_count: ${payload.counters.search_count}`,
+        `timeline_count: ${payload.counters.timeline_count}`,
+        `get_count: ${payload.counters.get_count}`,
+        `last_search_hits: ${payload.last_search.hits}`,
+        `last_search_query: ${payload.last_search.query || "none"}`,
+        `retrieval_mode: ${payload.retrieval_mode || "n/a"}`,
+        `vector_hits: ${payload.vector_hits}`,
+        `vector_engine: ${payload.vector_engine || "n/a"}`,
+        `fallback_reason: ${payload.fallback_reason || "none"}`,
+        `ann_recall_probe: ${payload.ann_recall_probe ? JSON.stringify(payload.ann_recall_probe) : "n/a"}`,
+      ].join("\n"),
+    );
+  }
+
+  if (cmd === "doctor") {
+    const asJson = hasFlag(args, "--json");
+    const state = await storage.readState();
+    const sqlite = await sqliteIndexDoctor(storage.workspaceDir, config);
+    const embeddingHot = await storage.readHistoryEmbeddingHot();
+    const embeddingArchive = await storage.readHistoryEmbeddingArchive();
+    const embeddingDims = new Set([
+      ...embeddingHot.map((row) => Number(row.dim || 0)),
+      ...embeddingArchive.map((row) => Number(row.dim || 0)),
+    ].filter((n) => Number.isFinite(n) && n > 0));
+    const payload = {
+      layer: "DOCTOR",
+      sqlite_index: sqlite,
+      embedding: {
+        provider: String(config.vectorProvider || "none"),
+        model: String(config.embeddingModel || ""),
+        hot_rows: embeddingHot.length,
+        archive_rows: embeddingArchive.length,
+        dims: Array.from(embeddingDims).sort((a, b) => a - b),
+        dims_consistent: embeddingDims.size <= 1,
+      },
+      history: {
+        bad_line_count: Number(state.badLineCount || 0),
+      },
+    };
+    const jsonOut = jsonOrText(payload, asJson);
+    if (jsonOut) {
+      return jsonOut;
+    }
+    return textResult(
+      [
+        "# ctx doctor",
+        `sqlite.available: ${String(Boolean(sqlite?.available))}`,
+        `sqlite.reason: ${String(sqlite?.reason || "ok")}`,
+        `sqlite.turns: ${Number(sqlite?.turns || 0)}`,
+        `sqlite.turns_fts: ${Number(sqlite?.turns_fts || 0)}`,
+        `sqlite.vector.available: ${String(Boolean(sqlite?.vector?.available))}`,
+        `sqlite.vector.engine: ${String(sqlite?.vector?.engine || "sqlite_vec")}`,
+        `sqlite.vector.rows: ${Number(sqlite?.vector?.rows || 0)}`,
+        `sqlite.vector.dim: ${Number(sqlite?.vector?.dim || 0)}`,
+        `sqlite.vector.embedding_version: ${String(sqlite?.vector?.embedding_version || "") || "n/a"}`,
+        `sqlite.vector.reason: ${String(sqlite?.vector?.reason || "ok")}`,
+        `embedding.provider: ${payload.embedding.provider}`,
+        `embedding.model: ${payload.embedding.model || "n/a"}`,
+        `embedding.hot_rows: ${payload.embedding.hot_rows}`,
+        `embedding.archive_rows: ${payload.embedding.archive_rows}`,
+        `embedding.dims: ${payload.embedding.dims.join(",") || "n/a"}`,
+        `embedding.dims_consistent: ${String(payload.embedding.dims_consistent)}`,
+        `history.bad_line_count: ${payload.history.bad_line_count}`,
       ].join("\n"),
     );
   }
@@ -799,11 +1045,16 @@ export async function runCtxCommandArgs(rawArgv, storage, config) {
     const asJson = hasFlag(args, "--json");
     const k = clampInt(toInt(getFlagValue(args, "--k", config.searchDefaultK), config.searchDefaultK), 1, 50);
     const scope = String(getFlagValue(args, "--scope", "all") || "all").toLowerCase();
-    const session = await getSessionFilter(args, storage, 'ctx search "<query>" [--k 5] [--scope all|hot|archive] [--session all|current|<id>]');
+    const requestedMode = normalizeSearchMode(
+      getFlagValue(args, "--mode", config.searchModeDefault || "fallback"),
+      normalizeSearchMode(config.searchModeDefault || "fallback", "fallback"),
+    );
+    const session = await getSessionFilter(args, storage, 'ctx search "<query>" [--k 5] [--scope all|hot|archive] [--mode legacy|lexical|vector|hybrid|fallback] [--session all|current|<id>]');
 
     const traceArgs = {
       k,
       scope,
+      mode: requestedMode,
       session: sessionLabel(session),
     };
     const traceBudgets = {
@@ -837,11 +1088,11 @@ export async function runCtxCommandArgs(rawArgv, storage, config) {
       return errorResult(session.error);
     }
 
-    const cleanArgs = stripFlags(args, ["--k", "--session"]);
-    const query = stripFlags(cleanArgs, ["--scope"]).join(" ").trim();
+    const cleanArgs = stripFlags(args, ["--k", "--scope", "--session", "--mode"]);
+    const query = cleanArgs.join(" ").trim();
     if (!query) {
-      await writeTraceError('usage: ctx search "<query>" [--k 5] [--scope all|hot|archive] [--session all|current|<id>]');
-      return errorResult('usage: ctx search "<query>" [--k 5] [--scope all|hot|archive] [--session all|current|<id>]');
+      await writeTraceError('usage: ctx search "<query>" [--k 5] [--scope all|hot|archive] [--mode legacy|lexical|vector|hybrid|fallback] [--session all|current|<id>]');
+      return errorResult('usage: ctx search "<query>" [--k 5] [--scope all|hot|archive] [--mode legacy|lexical|vector|hybrid|fallback] [--session all|current|<id>]');
     }
 
     const truncatedFields = new Set();
@@ -861,14 +1112,54 @@ export async function runCtxCommandArgs(rawArgv, storage, config) {
       k,
       500,
     );
-    const lexicalRanked = sessionPool
-      .map((entry) => ({
-        entry,
-        score: scoreEntry(entry, queryTokens, newestTs),
-      }))
-      .filter((item) => item.score > 0)
-      .sort((a, b) => (b.score - a.score) || String(b.entry.ts || "").localeCompare(String(a.entry.ts || "")))
-      .slice(0, candidateMax);
+    const latency = {
+      lexical: 0,
+      vector: 0,
+      fusion: 0,
+      total: 0,
+    };
+
+    const lexicalStartedAt = Date.now();
+    let lexicalEngineUsed = "legacy";
+    let lexicalFallbackReason = "";
+    let lexicalRanked = [];
+    const sqlitePreferred = requestedMode === "lexical" || requestedMode === "hybrid" || requestedMode === "fallback";
+    if (sqlitePreferred) {
+      try {
+        const sqliteResult = await searchSqliteLexical(storage.workspaceDir, config, {
+          query,
+          k: Math.max(k, candidateMax),
+          scope,
+          sessionId: session.mode === "all" ? "" : String(session.sessionId || ""),
+        });
+        if (sqliteResult?.available) {
+          lexicalEngineUsed = "sqlite_fts5";
+          lexicalRanked = (Array.isArray(sqliteResult.rows) ? sqliteResult.rows : [])
+            .map((entry) => ({
+              entry,
+              score: Number(entry.score || 0),
+            }))
+            .filter((item) => item.score > 0)
+            .slice(0, candidateMax);
+        } else {
+          lexicalFallbackReason = safeOneLine(String(sqliteResult?.reason || "sqlite lexical unavailable"), 220);
+        }
+      } catch (err) {
+        lexicalFallbackReason = safeOneLine(String(err?.message || err), 220);
+      }
+    }
+    if (requestedMode === "legacy" || (!lexicalRanked.length && lexicalEngineUsed !== "sqlite_fts5")) {
+      lexicalEngineUsed = "legacy";
+      lexicalRanked = sessionPool
+        .map((entry) => ({
+          entry,
+          score: scoreEntry(entry, queryTokens, newestTs),
+        }))
+        .filter((item) => item.score > 0)
+        .sort((a, b) => (b.score - a.score) || String(b.entry.ts || "").localeCompare(String(a.entry.ts || "")))
+        .slice(0, candidateMax);
+    }
+    latency.lexical = Date.now() - lexicalStartedAt;
     const lexicalRankById = new Map();
     for (let i = 0; i < lexicalRanked.length; i += 1) {
       const item = lexicalRanked[i];
@@ -882,42 +1173,146 @@ export async function runCtxCommandArgs(rawArgv, storage, config) {
     const retrievalModeConfigured = normalizeRetrievalMode(config);
     let retrievalModeUsed = "lexical";
     let vectorFallbackReason = "";
+    let vectorEngineUsed = "";
+    let annRecallProbe = null;
     let vectorRanked = [];
-    if (shouldUseHybridRetrieval(config)) {
-      retrievalModeUsed = "hybrid";
+    const vectorStartedAt = Date.now();
+    const vectorWanted =
+      requestedMode === "vector"
+      || requestedMode === "hybrid"
+      || (requestedMode === "fallback" && shouldUseHybridRetrieval(config));
+    if (vectorWanted) {
+      retrievalModeUsed = requestedMode === "vector" ? "vector" : "hybrid";
       try {
-        const provider = createEmbeddingProvider(config);
-        const queryEmbedding = await provider.embedText(query);
-        const byId = await ensureVectorRows(storage, provider, sessionPool, hotIds, config);
-        const vectorMinSimilarity = 0.35;
-        const vectorCandidates = [];
-        for (const entry of sessionPool) {
-          const id = String(entry?.id || "");
-          if (!id) {
-            continue;
-          }
-          const row = byId.get(id);
-          if (!row || !Array.isArray(row.vec) || !row.vec.length) {
-            continue;
-          }
-          const score = cosineSimilarity(queryEmbedding.vector, row.vec);
-          if (!Number.isFinite(score) || score < vectorMinSimilarity) {
-            continue;
-          }
-          vectorCandidates.push({
-            entry,
-            score,
-          });
+        const providerConfig = {
+          ...config,
+          retrievalMode: "hybrid",
+          vectorEnabled: true,
+        };
+        const provider = createEmbeddingProvider(providerConfig);
+        const embeddedQuery = await embedTexts(provider, [query], { batchSize: 1 });
+        const queryEmbedding = embeddedQuery[0];
+        const queryVector = Array.isArray(queryEmbedding?.vector) ? queryEmbedding.vector : [];
+        if (!queryVector.length) {
+          throw new Error("query embedding is empty");
         }
+        await ensureVectorRows(storage, provider, sessionPool, hotIds, providerConfig);
         const vectorLimit = clampInt(toInt(config.vectorTopN, 20), 1, 200);
-        vectorRanked = vectorCandidates
-          .sort((a, b) => (b.score - a.score) || String(b.entry.ts || "").localeCompare(String(a.entry.ts || "")))
-          .slice(0, Math.max(k, vectorLimit, candidateMax));
+        const vectorCandidateK = Math.max(k, vectorLimit, candidateMax);
+        const sessionId = session.mode === "all" ? "" : String(session.sessionId || "");
+        const annEnabled = providerConfig.annEnabled !== false;
+        const annResult = annEnabled
+          ? await searchSqliteVectorAnn(
+            storage.workspaceDir,
+            providerConfig,
+            queryVector,
+            {
+              k: vectorCandidateK,
+              scope,
+              sessionId,
+              annTopN: Math.max(vectorCandidateK, clampInt(toInt(config.annTopN, vectorCandidateK), vectorCandidateK, 5000)),
+              embeddingVersion: String(queryEmbedding?.embedding_version || ""),
+            },
+          )
+          : {
+            available: false,
+            reason: "ann_disabled",
+            rows: [],
+          };
+        const annRows = annResult?.available ? (Array.isArray(annResult.rows) ? annResult.rows : []) : [];
+        let linearResult = null;
+        if (!annRows.length) {
+          linearResult = await searchSqliteVectorLinear(
+            storage.workspaceDir,
+            providerConfig,
+            queryVector,
+            {
+              k: vectorCandidateK,
+              scope,
+              sessionId,
+              minSimilarity: Number(config.vectorMinSimilarity ?? 0.35),
+              linearLimit: Math.max(
+                vectorCandidateK,
+                clampInt(toInt(config.annProbeTopN, vectorCandidateK), vectorCandidateK, 100000),
+              ),
+              embeddingVersion: String(queryEmbedding?.embedding_version || ""),
+            },
+          );
+        }
+        let vectorRows = [];
+        if (annRows.length) {
+          vectorEngineUsed = "sqlite_vec_ann";
+          vectorRows = annRows;
+        } else if (linearResult?.available) {
+          vectorEngineUsed = "sqlite_vec_linear";
+          vectorRows = Array.isArray(linearResult.rows) ? linearResult.rows : [];
+          if (!vectorRows.length) {
+            const annReason = String(annResult?.reason || "ann_no_hits");
+            const linearReason = String(linearResult?.reason || "linear_no_hits");
+            vectorFallbackReason = safeOneLine(`${annReason}; ${linearReason}`, 220);
+          }
+        } else {
+          retrievalModeUsed = "lexical";
+          const annReason = String(annResult?.reason || "ann_unavailable");
+          const linearReason = String(linearResult?.reason || "linear_unavailable");
+          vectorFallbackReason = safeOneLine(`${annReason}; ${linearReason}`, 220);
+        }
+        if (vectorRows.length && vectorEngineUsed === "sqlite_vec_ann") {
+          const probeN = clampInt(toInt(config.annProbeTopN, 0), 0, 5000);
+          if (probeN > 0 && Math.random() < 0.1) {
+            const probeLinear = await searchSqliteVectorLinear(
+              storage.workspaceDir,
+              providerConfig,
+              queryVector,
+              {
+                k: probeN,
+                scope,
+                sessionId,
+                minSimilarity: -1,
+                linearLimit: Math.max(probeN, vectorCandidateK),
+                embeddingVersion: String(queryEmbedding?.embedding_version || ""),
+              },
+            );
+            if (probeLinear?.available) {
+              const annTop = vectorRows.slice(0, probeN).map((row) => String(row?.id || ""));
+              const linearTop = (Array.isArray(probeLinear.rows) ? probeLinear.rows : [])
+                .slice(0, probeN)
+                .map((row) => String(row?.id || ""));
+              const annSet = new Set(annTop.filter(Boolean));
+              let overlap = 0;
+              for (const id of linearTop) {
+                if (annSet.has(id)) {
+                  overlap += 1;
+                }
+              }
+              const denom = Math.max(1, Math.min(probeN, linearTop.length));
+              annRecallProbe = {
+                probe_k: probeN,
+                overlap,
+                recall: Number((overlap / denom).toFixed(4)),
+              };
+            }
+          }
+        }
+        vectorRanked = vectorRows
+          .map((entry) => ({
+            entry,
+            score: Number(entry?.score || 0),
+          }))
+          .filter((row) => Number.isFinite(row.score) && row.score > 0)
+          .slice(0, vectorCandidateK);
+        if (!vectorRanked.length) {
+          retrievalModeUsed = "lexical";
+          if (!vectorFallbackReason) {
+            vectorFallbackReason = "vector_no_hits";
+          }
+        }
       } catch (err) {
         retrievalModeUsed = "lexical";
         vectorFallbackReason = safeOneLine(String(err?.message || err), 220);
       }
     }
+    latency.vector = Date.now() - vectorStartedAt;
     const vectorRankById = new Map();
     for (let i = 0; i < vectorRanked.length; i += 1) {
       const item = vectorRanked[i];
@@ -928,6 +1323,7 @@ export async function runCtxCommandArgs(rawArgv, storage, config) {
       });
     }
     const fusedRanked = [];
+    const fusionStartedAt = Date.now();
     if (retrievalModeUsed === "hybrid" && vectorRankById.size > 0) {
       const rrfK = clampInt(toInt(config.fusionRrfK, 60), 1, 500);
       const merged = new Map();
@@ -964,9 +1360,22 @@ export async function runCtxCommandArgs(rawArgv, storage, config) {
       }
       fusedRanked.sort((a, b) => (b.score - a.score) || String(b.entry.ts || "").localeCompare(String(a.entry.ts || "")));
     }
-    const finalRanked = (retrievalModeUsed === "hybrid" && fusedRanked.length > 0)
-      ? fusedRanked.slice(0, k)
-      : lexicalRanked.slice(0, k).map((item, idx) => ({
+    latency.fusion = Date.now() - fusionStartedAt;
+    let finalRanked = [];
+    if (retrievalModeUsed === "vector") {
+      finalRanked = vectorRanked.map((item, idx) => ({
+        entry: item.entry,
+        lexicalRank: null,
+        lexicalScore: 0,
+        vectorRank: idx + 1,
+        vectorScore: item.score,
+        score: item.score,
+        match: "vector",
+      })).slice(0, k);
+    } else if (retrievalModeUsed === "hybrid" && fusedRanked.length > 0) {
+      finalRanked = fusedRanked.slice(0, k);
+    } else {
+      finalRanked = lexicalRanked.slice(0, k).map((item, idx) => ({
         entry: item.entry,
         lexicalRank: idx + 1,
         lexicalScore: item.score,
@@ -975,13 +1384,42 @@ export async function runCtxCommandArgs(rawArgv, storage, config) {
         score: item.score,
         match: "lexical",
       }));
+    }
+    if (!finalRanked.length && requestedMode !== "legacy" && lexicalEngineUsed === "sqlite_fts5" && sessionPool.length > 0) {
+      const fallbackLegacy = sessionPool
+        .map((entry) => ({
+          entry,
+          score: scoreEntry(entry, queryTokens, newestTs),
+        }))
+        .filter((item) => item.score > 0)
+        .sort((a, b) => (b.score - a.score) || String(b.entry.ts || "").localeCompare(String(a.entry.ts || "")))
+        .slice(0, k)
+        .map((item, idx) => ({
+          entry: item.entry,
+          lexicalRank: idx + 1,
+          lexicalScore: item.score,
+          vectorRank: null,
+          vectorScore: 0,
+          score: item.score,
+          match: "lexical",
+        }));
+      if (fallbackLegacy.length) {
+        finalRanked = fallbackLegacy;
+        retrievalModeUsed = "lexical";
+        lexicalEngineUsed = "legacy";
+        lexicalFallbackReason = lexicalFallbackReason || "sqlite lexical returned no hits; fallback to legacy lexical";
+      }
+    }
     const rows = finalRanked.map((item) => ({
       ...(() => {
         const entry = item.entry;
-        const source = sourceForId(entry.id, hotIds);
+        const source = String(entry?.source || sourceForId(entry.id, hotIds));
         const row = toL0Row(entry, config, source, {
           score: Number(item.score.toFixed(3)),
           match: item.match,
+          score_lex: Number((item.lexicalScore || 0).toFixed(6)),
+          score_vec: Number((item.vectorScore || 0).toFixed(6)),
+          score_final: Number((item.score || 0).toFixed(6)),
         });
 
         const beforeDefault = config.timelineBeforeDefault;
@@ -1012,13 +1450,20 @@ export async function runCtxCommandArgs(rawArgv, storage, config) {
         return row;
       })(),
     }));
+    latency.total = Date.now() - startedAt;
     const retrievalStats = {
       configured_mode: retrievalModeConfigured,
+      requested_mode: requestedMode,
       mode: retrievalModeUsed,
+      lexical_engine: lexicalEngineUsed,
+      vector_engine: vectorEngineUsed || null,
       lexical_hits: lexicalRanked.length,
       vector_hits: vectorRanked.length,
       fused_hits: fusedRanked.length || rows.length,
-      ...(vectorFallbackReason ? { fallback_reason: vectorFallbackReason } : {}),
+      latency_ms: latency,
+      ...(lexicalFallbackReason ? { lexical_fallback_reason: lexicalFallbackReason } : {}),
+      ...(vectorFallbackReason ? { vector_fallback_reason: vectorFallbackReason, fallback_reason: vectorFallbackReason } : {}),
+      ...(annRecallProbe ? { ann_recall_probe: annRecallProbe } : {}),
     };
 
     const state = await storage.updateState((cur) => ({
@@ -1143,7 +1588,7 @@ export async function runCtxCommandArgs(rawArgv, storage, config) {
     }
 
     const history = await storage.readHistory();
-    const archive = asArchiveSearchRows(await storage.readHistoryArchiveIndex());
+    const archive = mergeUniqueHistory([], asArchiveSearchRows(await storage.readHistoryArchive()));
     const hotMatches = findIdMatches(history, anchorId);
     const archiveMatches = findIdMatches(archive, anchorId);
     const sourceList = hotMatches.length ? history : archive;
@@ -1511,18 +1956,41 @@ export async function runCtxCommandArgs(rawArgv, storage, config) {
   }
 
   if (cmd === "reindex") {
+    const full = hasFlag(args, "--full");
     if (hasFlag(args, "--embedding") || hasFlag(args, "--embeddings")) {
       return errorResult(
-        "ctx reindex only rebuilds history.archive.index.ndjson (lexical index); embedding files are maintained automatically",
+        "ctx reindex --vectors rebuilds SQLite vector index; use --full for lexical sqlite rebuild",
       );
     }
-    const result = await storage.rebuildHistoryArchiveIndex();
+    const vectors = hasFlag(args, "--vectors");
+    const modelRaw = getFlagValue(args, "--model", "");
+    if (args.includes("--model") && isMissingFlagValue(modelRaw)) {
+      return errorResult("usage: ctx reindex [--full] [--vectors] [--model <name>]");
+    }
+    const model = String(modelRaw || "").trim();
+    let sqliteResult = { rebuilt: false, reason: "skip (use --full)" };
+    if (full) {
+      sqliteResult = await rebuildSqliteIndexFromStorage(storage, config);
+    }
+    let vectorResult = { rebuilt: false, reason: "skip (use --vectors)" };
+    if (vectors) {
+      vectorResult = await rebuildVectorRows(storage, config, model);
+    }
     return textResult(
       [
         "reindex done",
-        `- rebuilt: ${String(result.rebuilt)}`,
-        `- archive_entries: ${result.archiveEntries}`,
-        `- index_entries: ${result.indexEntries}`,
+        `- sqlite.rebuilt: ${String(Boolean(sqliteResult?.rebuilt))}`,
+        `- sqlite.available: ${String(Boolean(sqliteResult?.available))}`,
+        `- sqlite.rows: ${Number(sqliteResult?.rows || 0)}`,
+        `- sqlite.reason: ${String(sqliteResult?.reason || "ok")}`,
+        `- vectors.rebuilt: ${String(Boolean(vectorResult?.rebuilt))}`,
+        `- vectors.count: ${Number(vectorResult?.vectors || 0)}`,
+        `- vectors.provider: ${String(vectorResult?.provider || "n/a")}`,
+        `- vectors.model: ${String(vectorResult?.model || "n/a")}`,
+        `- vectors.dim: ${Number(vectorResult?.dim || 0)}`,
+        `- vectors.embedding_version: ${String(vectorResult?.embedding_version || "") || "n/a"}`,
+        `- vectors.sqlite_available: ${String(Boolean(vectorResult?.sqlite_available ?? vectorResult?.available))}`,
+        `- vectors.reason: ${String(vectorResult?.reason || "ok")}`,
       ].join("\n"),
     );
   }

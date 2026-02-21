@@ -11,6 +11,7 @@ import {
   searchRecords,
   timelineRecords,
 } from "./src/retrieval_api.mjs";
+import { loadContextFsEnv } from "./src/env.mjs";
 
 const SERVER_NAME = "contextfs";
 const SERVER_VERSION = "0.1.0";
@@ -27,6 +28,7 @@ const TOOL_DEFINITIONS = [
         query: { type: "string", minLength: 1 },
         k: { type: "integer", minimum: 1, maximum: 50 },
         scope: { type: "string", enum: ["all", "hot", "archive"] },
+        mode: { type: "string", enum: ["legacy", "lexical", "vector", "hybrid", "fallback"] },
         session: { type: "string" },
         session_id: { type: "string" },
       },
@@ -168,6 +170,7 @@ function makeTextContent(text) {
 }
 
 const workspaceDir = parseServerArgs(process.argv.slice(2));
+await loadContextFsEnv();
 const config = mergeConfig({
   ...(globalThis.CONTEXTFS_CONFIG || {}),
   contextfsDir: ".contextfs",

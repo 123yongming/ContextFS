@@ -1,26 +1,36 @@
 # AGENTS.md
 Agent playbook for `D:\code\python_code\ContextFS`.
-Use this as the quick-start reference for coding agents working in this repo.
+Use this as the default operating guide for coding agents in this repo.
 
 ## 1) Repository Map
 - Root scripts: `package.json`
+- OpenCode package: `.opencode/package.json`
 - Plugin package: `.opencode/plugins/contextfs/package.json`
 - Plugin entry: `.opencode/plugins/contextfs.plugin.mjs`
 - CLI entry: `.opencode/plugins/contextfs/cli.mjs`
 - Runtime source: `.opencode/plugins/contextfs/src/*.mjs`
+- SQLite/index code: `.opencode/plugins/contextfs/src/index/sqlite_store.mjs`
 - Tool bridge (TypeScript): `.opencode/tools/contextfs.ts`
-- Unit tests: `.opencode/plugins/contextfs/test/contextfs.test.mjs`
+- Plugin tests: `.opencode/plugins/contextfs/test/*.mjs`
 - Regression script: `scripts/regression-contextfs.mjs`
 - Bench scripts/tests: `bench/*.mjs`
-- User docs: `README.md`
+- Docs: `README.md`, `.opencode/plugins/contextfs/README.md`
 
 ## 2) Stack and Runtime Facts
-- Node.js project; plugin package is ESM (`"type": "module"`).
-- Runtime code is plain `.mjs`; no transpile/build step.
-- Test runner is Node built-in test (`node --test`).
+- Node.js project; plugin is ESM (`"type": "module"`).
+- Runtime is plain `.mjs` (no transpile/build pipeline).
+- Tests use Node built-in test runner (`node --test`).
+- SQLite support is via optional deps: `better-sqlite3` and `sqlite-vec`.
+- If optional SQLite deps are unavailable, search paths degrade gracefully.
 
-## 3) Cursor / Copilot Rule Files
-No Cursor/Copilot rule files found (`.cursorrules`, `.cursor/rules/`, `.github/copilot-instructions.md`).
+## 3) Cursor / Copilot Rules
+Checked paths:
+- `.cursorrules`
+- `.cursor/rules/**`
+- `.github/copilot-instructions.md`
+
+Result:
+- No Cursor or Copilot rule files were found in this repository.
 
 ## 4) Install / Build / Lint / Test Commands
 ### Install
@@ -28,33 +38,38 @@ No Cursor/Copilot rule files found (`.cursorrules`, `.cursor/rules/`, `.github/c
 - Plugin-only install: `npm install --prefix .opencode/plugins/contextfs`
 
 ### Build
-- No `build` script; runtime is plain `.mjs` ESM (no compile pipeline).
+- No `build` script exists at root or plugin level.
+- Treat this repo as no-compile runtime JS/TS tooling.
 
 ### Lint / Format
-- No lint/format scripts in root or plugin `package.json`.
-- No repo lint config detected (ESLint/Prettier/Biome).
-- Match existing file style; do not introduce new tooling unless requested.
+- No lint/format scripts are defined in package scripts.
+- No ESLint/Prettier/Biome config detected.
+- Follow existing style; avoid introducing new tooling unless requested.
 
-### Tests (full suites)
-- Plugin unit tests via root script: `npm run test:contextfs:unit`
-- Plugin unit tests direct: `npm test --prefix .opencode/plugins/contextfs`
-- Regression suite: `npm run test:contextfs:regression`
+### Test Suites (full)
+- Plugin tests via root alias: `npm run test:contextfs:unit`
+- Plugin tests direct: `npm test --prefix .opencode/plugins/contextfs`
+- Regression tests: `npm run test:contextfs:regression`
 - Bench tests: `node --test ./bench/bench.test.mjs`
 
-Notes:
-- Plugin unit tests run with `--test-isolation=none` (see `.opencode/plugins/contextfs/package.json`). Preserve that when running tests directly.
+Important:
+- Plugin tests run with `--test-isolation=none`; preserve this for direct Node commands.
 
-### Tests (single test)
-Use Node test name filtering:
-- Plugin single test:
+### Single-Test Commands
+Use Node name filtering with `--test-name-pattern`:
+- Plugin single test (direct):
   - `node --test --test-isolation=none --test-name-pattern="compacted turns remain retrievable via archive fallback" ./.opencode/plugins/contextfs/test/contextfs.test.mjs`
-- Plugin single test via npm (passes args through):
+- Plugin single test (via npm):
   - `npm test --prefix .opencode/plugins/contextfs -- --test-name-pattern="estimateTokens is stable and monotonic"`
+- MCP integration single test:
+  - `node --test --test-isolation=none --test-name-pattern="save_memory returns WRITE payload" ./.opencode/plugins/contextfs/test/contextfs.mcp.test.mjs`
 - Bench single test:
   - `node --test --test-name-pattern="timing fields are sane in jsonl outputs" ./bench/bench.test.mjs`
 
-### Bench runs
+### Bench Run Examples
 - `npm run bench -- --turns 3000 --avgChars 400 --variance 0.6 --seed 42 --orders 2`
+- `npm run bench:e2e`
+- `npm run bench:naive`
 
 ## 5) ContextFS CLI Sanity Commands
 - `node .opencode/plugins/contextfs/cli.mjs ls`
@@ -62,88 +77,97 @@ Use Node test name filtering:
 - `node .opencode/plugins/contextfs/cli.mjs search "lock timeout" --k 5 --scope all`
 - `node .opencode/plugins/contextfs/cli.mjs timeline H-abc12345 --before 3 --after 3`
 - `node .opencode/plugins/contextfs/cli.mjs get H-abc12345 --head 1200`
-- `node .opencode/plugins/contextfs/cli.mjs reindex`
+- `node .opencode/plugins/contextfs/cli.mjs doctor --json`
+- `node .opencode/plugins/contextfs/cli.mjs reindex --full --vectors`
 
-Preferred interactive usage (OpenCode chat): `/ctx ...` (see `README.md`).
+Preferred interactive mode (OpenCode chat): `/ctx ...`.
 
 ## 6) Code Style and Implementation Conventions
 ### Imports
 - Use ESM `import` syntax in `.mjs` and `.ts` files.
 - Use `node:` specifiers for built-ins (`node:fs/promises`, `node:path`, etc.).
-- Keep built-in imports above local imports.
-- Separate import groups with one blank line.
+- Put built-in imports before local imports.
+- Keep one blank line between import groups.
 - Prefer double quotes.
 
 ### Formatting
 - Two-space indentation.
-- Prefer trailing commas in multiline literals/calls.
-- Favor small helpers and early returns over deep nesting.
-
-Note: semicolon usage is mixed across modules (some files omit them). Do not reformat unrelated lines; follow the surrounding file’s style.
+- Prefer trailing commas in multiline arrays/objects/calls.
+- Prefer small helpers and early returns over deep nesting.
+- Keep semicolon style consistent with the touched file (mixed in repo).
+- Do not reformat unrelated lines.
 
 ### Naming
-- Variables/functions: `camelCase`.
-- Classes: `PascalCase` (example: `ContextFsStorage`).
-- Constants: `UPPER_SNAKE_CASE` (`FILES`, `RETRYABLE_LOCK_ERRORS`).
-- Tests use descriptive sentence-style names in `test("...", ...)`.
+- Variables/functions: `camelCase`
+- Classes/types: `PascalCase`
+- Constants: `UPPER_SNAKE_CASE`
+- Test names: descriptive sentence-style `test("...", ...)`
 
 ### Types and Input Normalization
-- Normalize external input aggressively (`String(...)`, `Number(...)`, `.trim()`).
-- Validate and clamp numeric config boundaries in one place.
-- Keep retrieval/history row schemas explicit and stable (`id`, `ts`, `role`, `type`, `refs`, `text`).
-- In TypeScript bridge code, avoid `any` unless there is clear justification.
+- Normalize external input with `String(...)`, `Number(...)`, `.trim()`.
+- Clamp numeric config values in a single normalization path.
+- Keep row shapes explicit and stable (`id`, `ts`, `role`, `type`, `session_id`, `refs`, `text`).
+- In TypeScript bridge code, avoid `any` unless there is clear, local justification.
 
-CLI/JSON contracts to preserve:
-- `ctx search --json` / `ctx timeline --json` return stable L0 rows with `layer: "L0"`.
-- `ctx get --json` returns `layer: "L2"` and applies byte-budget trimming via `--head`.
-
-### Async, I/O, and Concurrency
+### Async / I/O / Concurrency
 - Use `async/await` consistently.
-- Preserve lock-aware writes for mutable files.
-- Keep file writes atomic where consistency matters.
-- Keep history files NDJSON (one JSON object per line).
-- Preserve archive split contract:
-  - `history.ndjson` = hot recent turns
-  - `history.archive.ndjson` = compacted historical turns
-  - `history.archive.index.ndjson` = archive retrieval index
+- Preserve lock-aware writes and atomic write patterns.
+- Keep history files in NDJSON format (one JSON object per line).
+- Preserve history split contract:
+  - `history.ndjson`: hot/recent turns
+  - `history.archive.ndjson`: compacted historical turns
+  - `history.embedding.hot.ndjson` and `.archive.ndjson`: vector source rows
 
 ### Error Handling
 - Throw explicit errors for hard failures.
-- Use narrow `try/finally` for lock cleanup and restoration flows.
-- Avoid silent failure paths; if ignoring malformed lines, keep behavior deliberate and bounded (e.g., malformed NDJSON lines are tracked in `history.bad.ndjson`).
-- CLI should return structured errors and non-zero exit code on fatal failures.
+- Use narrow `try/finally` for lock cleanup/recovery.
+- Avoid swallowing errors silently unless behavior is intentionally best-effort.
+- Keep CLI failures structured with non-zero exit code on fatal errors.
 
-### Configuration
-- Default config and clamping live in `.opencode/plugins/contextfs/src/config.mjs`.
-- Override via `globalThis.CONTEXTFS_CONFIG = { ... }` (used by plugin) or set `CONTEXTFS_DEBUG=1` to enable debug logging.
+### Configuration and Contracts
+- Canonical defaults/clamping: `.opencode/plugins/contextfs/src/config.mjs`.
+- Runtime overrides:
+  - `globalThis.CONTEXTFS_CONFIG = { ... }`
+  - `.opencode/plugins/contextfs/.env`
+  - `CONTEXTFS_DEBUG=1` for debug logging
+- Preserve JSON contracts:
+  - `ctx search --json` / `ctx timeline --json` return L0 rows with `layer: "L0"`
+  - `ctx get --json` returns L2 payload with `layer: "L2"`
+  - `ctx save --json` returns WRITE payload
 
-### Output and UX Contracts
-- Keep CLI output line-oriented and stable.
-- Keep JSON output parseable and backward-safe.
-- Do not break existing command names or output fields unless explicitly requested.
+### Retrieval / Index Notes
+- `history*.ndjson` is source-of-truth data.
+- `index.sqlite` is derived index data for lexical/vector retrieval.
+- Do not assume sqlite row count equality implies semantic parity; use `ctx doctor` and reindex paths where needed.
 
 ## 7) Test Scope by Change Type
-- If touching storage/compaction/retrieval (`src/storage.mjs`, `src/compactor.mjs`, `src/commands.mjs`):
+- If touching storage/compaction/retrieval (`src/storage.mjs`, `src/compactor.mjs`, `src/commands.mjs`, `src/index/sqlite_store.mjs`):
   - Run `npm run test:contextfs:unit`
   - Run `npm run test:contextfs:regression`
-- If touching benchmark logic:
+- If touching MCP/tool bridge (`mcp-server.mjs`, `.opencode/tools/contextfs.ts`):
+  - Run plugin tests including MCP coverage
+  - Run at least one CLI sanity command
+- If touching bench logic:
   - Run `node --test ./bench/bench.test.mjs`
-  - Run at least one bench command from section 4
-- If touching CLI behavior:
-  - Run at least one CLI sanity command from section 5
+  - Run one bench script (`bench` or `bench:e2e`)
+- If touching CLI output/flags:
+  - Run at least two CLI sanity commands, including one `--json` path
 
 ## 8) Agent Guardrails
 - Keep edits focused; avoid unrelated refactors.
-- Preserve CLI compatibility unless a change is explicitly requested.
-- Update `README.md` when user-visible command behavior/flags change.
-- Never commit runtime state (`.contextfs/`) or lock artifacts.
+- Preserve CLI command names and output fields unless explicitly requested.
+- Update user docs when behavior/flags/contracts change.
+- Never commit runtime state (`.contextfs/`) or lock files.
+- Do not hand-edit generated runtime artifacts except for debugging.
 
 ## 9) Repo Notes
-- `.contextfs/` contains runtime data and is ignored.
-- `docs/` is ignored in `.gitignore`; only force-add it when you truly intend to commit docs.
-- For new commands/flags, update docs and tests in the same change.
+- `.contextfs/` contains runtime data and should remain ignored.
+- `docs/` is gitignored; force-add only when intentionally committing docs.
+- Root `.opencode/package.json` only provides OpenCode plugin dependency.
+- Plugin optional dependencies may fail to install in some environments; code should handle graceful fallback.
 
-## 10) Hand-off Checklist
-1. Verify commands against actual `package.json` scripts.
-2. Run relevant tests (full suite or targeted `--test-name-pattern`).
-3. Update `README.md`/`AGENTS.md` when user-visible behavior changes.
+## 10) Handoff Checklist
+1. Confirm commands against current `package.json` scripts.
+2. Run relevant tests (full or targeted via `--test-name-pattern`).
+3. Re-check CLI JSON/text output compatibility after changes.
+4. Update `README.md` and `AGENTS.md` when user-visible behavior changed.

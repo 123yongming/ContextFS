@@ -336,6 +336,11 @@ async function withMcpClient(workspaceDir, run) {
   const proc = spawn(process.execPath, [serverPath, "--workspace", workspaceDir], {
     cwd: path.dirname(serverPath),
     stdio: ["pipe", "pipe", "pipe"],
+    env: {
+      ...process.env,
+      CONTEXTFS_EMBEDDING_PROVIDER: "fake",
+      CONTEXTFS_VECTOR_PROVIDER: "fake",
+    },
   });
   const client = new StdioMcpClient(proc);
   try {
@@ -351,6 +356,11 @@ async function withLineJsonMcpClient(workspaceDir, run) {
   const proc = spawn(process.execPath, [serverPath, "--workspace", workspaceDir], {
     cwd: path.dirname(serverPath),
     stdio: ["pipe", "pipe", "pipe"],
+    env: {
+      ...process.env,
+      CONTEXTFS_EMBEDDING_PROVIDER: "fake",
+      CONTEXTFS_VECTOR_PROVIDER: "fake",
+    },
   });
   const client = new LineJsonMcpClient(proc);
   try {

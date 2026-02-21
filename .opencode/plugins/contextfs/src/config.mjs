@@ -26,8 +26,23 @@ export const DEFAULT_CONFIG = {
   retrievalMode: "hybrid",
   vectorEnabled: true,
   vectorProvider: "fake",
+  embeddingModel: "Pro/BAAI/bge-m3",
+  embeddingBaseUrl: "https://api.siliconflow.cn/v1",
+  embeddingApiKey: "",
+  embeddingTimeoutMs: 20000,
+  embeddingMaxRetries: 3,
+  embeddingBatchSize: 32,
   vectorDim: 64,
   vectorTopN: 20,
+  vectorMinSimilarity: 0.35,
+  searchModeDefault: "fallback",
+  lexicalEngine: "legacy",
+  vectorEngine: "sqlite_vec",
+  indexEnabled: true,
+  indexPath: "index.sqlite",
+  annEnabled: true,
+  annTopN: 50,
+  annProbeTopN: 200,
   fusionRrfK: 60,
   fusionCandidateMax: 100,
   embeddingTextMaxChars: 4000,
@@ -85,17 +100,95 @@ function normalizeRetrievalMode(value, fallback) {
   return fallback;
 }
 
-function normalizeVectorProvider(value, fallback) {
+function normalizeSearchMode(value, fallback) {
   const clean = String(value ?? "").trim().toLowerCase();
-  if (clean === "none" || clean === "fake" || clean === "custom") {
+  if (clean === "legacy" || clean === "lexical" || clean === "vector" || clean === "hybrid" || clean === "fallback") {
     return clean;
   }
   return fallback;
 }
 
+function normalizeLexicalEngine(value, fallback) {
+  const clean = String(value ?? "").trim().toLowerCase();
+  if (clean === "legacy" || clean === "sqlite_fts5") {
+    return clean;
+  }
+  return fallback;
+}
+
+function normalizeVectorEngine(value, fallback) {
+  const clean = String(value ?? "").trim().toLowerCase();
+  if (clean === "linear" || clean === "sqlite_vec") {
+    return clean;
+  }
+  return fallback;
+}
+
+function normalizeVectorProvider(value, fallback) {
+  const clean = String(value ?? "").trim().toLowerCase();
+  if (clean === "none" || clean === "fake" || clean === "custom" || clean === "siliconflow") {
+    return clean;
+  }
+  return fallback;
+}
+
+function pickEnv(...keys) {
+  for (const key of keys) {
+    const raw = process.env[key];
+    if (raw === undefined || raw === null) {
+      continue;
+    }
+    const text = String(raw).trim();
+    if (!text) {
+      continue;
+    }
+    return text;
+  }
+  return undefined;
+}
+
+function envConfig() {
+  const cfg = {};
+  const retrievalMode = pickEnv("CONTEXTFS_RETRIEVAL_MODE");
+  const vectorEnabled = pickEnv("CONTEXTFS_VECTOR_ENABLED");
+  const vectorProvider = pickEnv("CONTEXTFS_EMBEDDING_PROVIDER", "CONTEXTFS_VECTOR_PROVIDER");
+  const embeddingModel = pickEnv("CONTEXTFS_EMBEDDING_MODEL");
+  const embeddingBaseUrl = pickEnv("CONTEXTFS_EMBEDDING_BASE_URL");
+  const embeddingApiKey = pickEnv("CONTEXTFS_EMBEDDING_API_KEY");
+  const embeddingTimeoutMs = pickEnv("CONTEXTFS_EMBEDDING_TIMEOUT_MS");
+  const embeddingMaxRetries = pickEnv("CONTEXTFS_EMBEDDING_MAX_RETRIES");
+  const embeddingBatchSize = pickEnv("CONTEXTFS_EMBEDDING_BATCH_SIZE");
+  const searchModeDefault = pickEnv("CONTEXTFS_SEARCH_MODE_DEFAULT");
+  const indexEnabled = pickEnv("CONTEXTFS_INDEX_ENABLED");
+  const indexPath = pickEnv("CONTEXTFS_INDEX_PATH");
+  const lexicalEngine = pickEnv("CONTEXTFS_LEXICAL_ENGINE");
+  const vectorEngine = pickEnv("CONTEXTFS_VECTOR_ENGINE");
+  const annEnabled = pickEnv("CONTEXTFS_ANN_ENABLED");
+  const annTopN = pickEnv("CONTEXTFS_ANN_TOP_N");
+
+  if (retrievalMode !== undefined) cfg.retrievalMode = retrievalMode;
+  if (vectorEnabled !== undefined) cfg.vectorEnabled = vectorEnabled;
+  if (vectorProvider !== undefined) cfg.vectorProvider = vectorProvider;
+  if (embeddingModel !== undefined) cfg.embeddingModel = embeddingModel;
+  if (embeddingBaseUrl !== undefined) cfg.embeddingBaseUrl = embeddingBaseUrl;
+  if (embeddingApiKey !== undefined) cfg.embeddingApiKey = embeddingApiKey;
+  if (embeddingTimeoutMs !== undefined) cfg.embeddingTimeoutMs = embeddingTimeoutMs;
+  if (embeddingMaxRetries !== undefined) cfg.embeddingMaxRetries = embeddingMaxRetries;
+  if (embeddingBatchSize !== undefined) cfg.embeddingBatchSize = embeddingBatchSize;
+  if (searchModeDefault !== undefined) cfg.searchModeDefault = searchModeDefault;
+  if (indexEnabled !== undefined) cfg.indexEnabled = indexEnabled;
+  if (indexPath !== undefined) cfg.indexPath = indexPath;
+  if (lexicalEngine !== undefined) cfg.lexicalEngine = lexicalEngine;
+  if (vectorEngine !== undefined) cfg.vectorEngine = vectorEngine;
+  if (annEnabled !== undefined) cfg.annEnabled = annEnabled;
+  if (annTopN !== undefined) cfg.annTopN = annTopN;
+  return cfg;
+}
+
 export function mergeConfig(userConfig = {}) {
   const merged = {
     ...DEFAULT_CONFIG,
+    ...envConfig(),
     ...userConfig,
   };
   const rawDelimiterStart = toText(merged.packDelimiterStart, DEFAULT_CONFIG.packDelimiterStart);
@@ -133,10 +226,25 @@ export function mergeConfig(userConfig = {}) {
     traceRankingMaxItems: clampInt(merged.traceRankingMaxItems, DEFAULT_CONFIG.traceRankingMaxItems, 1, 50),
     traceQueryMaxChars: clampInt(merged.traceQueryMaxChars, DEFAULT_CONFIG.traceQueryMaxChars, 40, 2000),
     retrievalMode: normalizeRetrievalMode(merged.retrievalMode, DEFAULT_CONFIG.retrievalMode),
+    searchModeDefault: normalizeSearchMode(merged.searchModeDefault, DEFAULT_CONFIG.searchModeDefault),
     vectorEnabled: toBool(merged.vectorEnabled, DEFAULT_CONFIG.vectorEnabled),
     vectorProvider: normalizeVectorProvider(merged.vectorProvider, DEFAULT_CONFIG.vectorProvider),
+    embeddingModel: toText(merged.embeddingModel, DEFAULT_CONFIG.embeddingModel),
+    embeddingBaseUrl: toText(merged.embeddingBaseUrl, DEFAULT_CONFIG.embeddingBaseUrl),
+    embeddingApiKey: toText(merged.embeddingApiKey, DEFAULT_CONFIG.embeddingApiKey),
+    embeddingTimeoutMs: clampInt(merged.embeddingTimeoutMs, DEFAULT_CONFIG.embeddingTimeoutMs, 1000, 120000),
+    embeddingMaxRetries: clampInt(merged.embeddingMaxRetries, DEFAULT_CONFIG.embeddingMaxRetries, 0, 10),
+    embeddingBatchSize: clampInt(merged.embeddingBatchSize, DEFAULT_CONFIG.embeddingBatchSize, 1, 256),
     vectorDim: clampInt(merged.vectorDim, DEFAULT_CONFIG.vectorDim, 8, 4096),
     vectorTopN: clampInt(merged.vectorTopN, DEFAULT_CONFIG.vectorTopN, 1, 200),
+    vectorMinSimilarity: clampFloat(merged.vectorMinSimilarity, DEFAULT_CONFIG.vectorMinSimilarity, -1, 1),
+    lexicalEngine: normalizeLexicalEngine(merged.lexicalEngine, DEFAULT_CONFIG.lexicalEngine),
+    vectorEngine: normalizeVectorEngine(merged.vectorEngine, DEFAULT_CONFIG.vectorEngine),
+    indexEnabled: toBool(merged.indexEnabled, DEFAULT_CONFIG.indexEnabled),
+    indexPath: toText(merged.indexPath, DEFAULT_CONFIG.indexPath),
+    annEnabled: toBool(merged.annEnabled, DEFAULT_CONFIG.annEnabled),
+    annTopN: clampInt(merged.annTopN, DEFAULT_CONFIG.annTopN, 1, 5000),
+    annProbeTopN: clampInt(merged.annProbeTopN, DEFAULT_CONFIG.annProbeTopN, 1, 10000),
     fusionRrfK: clampInt(merged.fusionRrfK, DEFAULT_CONFIG.fusionRrfK, 1, 500),
     fusionCandidateMax: clampInt(merged.fusionCandidateMax, DEFAULT_CONFIG.fusionCandidateMax, 1, 500),
     embeddingTextMaxChars: clampInt(merged.embeddingTextMaxChars, DEFAULT_CONFIG.embeddingTextMaxChars, 128, 20000),
