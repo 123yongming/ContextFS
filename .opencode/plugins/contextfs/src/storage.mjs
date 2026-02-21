@@ -1,7 +1,14 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 
-import { createEmbeddingProvider, hashEmbeddingText, normalizeEmbeddingText } from "./embedding.mjs";
+import { createEmbeddingProvider, embedTexts, hashEmbeddingText, normalizeEmbeddingText } from "./embedding.mjs";
+import {
+  pruneSqliteVectorRowsByTurnIds,
+  sqliteIndexDoctor,
+  toSqliteTurnRow,
+  upsertSqliteTurnRows,
+  upsertSqliteVectorRows,
+} from "./index/sqlite_store.mjs";
 
 const FILES = {
   manifest: "manifest.md",
@@ -9,7 +16,6 @@ const FILES = {
   summary: "summary.md",
   history: "history.ndjson",
   historyArchive: "history.archive.ndjson",
-  historyArchiveIndex: "history.archive.index.ndjson",
   historyEmbeddingHot: "history.embedding.hot.ndjson",
   historyEmbeddingArchive: "history.embedding.archive.ndjson",
   historyBad: "history.bad.ndjson",
@@ -200,6 +206,11 @@ function sleepMs(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+function isRetryableSqliteWriteError(err) {
+  const msg = String(err?.message || "").toUpperCase();
+  return msg.includes("SQLITE_BUSY") || msg.includes("SQLITE_LOCKED");
+}
+
 function makeTmpPath(target) {
   const rand = Math.random().toString(16).slice(2, 10);
   return `${target}.${process.pid}.${Date.now()}.${rand}.tmp`;
@@ -260,59 +271,6 @@ function embeddingStatsFromRaw(rawText) {
   };
 }
 
-function summarizeText(text, maxChars = 240) {
-  const oneLine = String(text || "").replace(/\s+/g, " ").trim();
-  if (oneLine.length <= maxChars) {
-    return oneLine;
-  }
-  return `${oneLine.slice(0, Math.max(0, maxChars - 3))}...`;
-}
-
-function toArchiveIndexEntry(entry, archivedAt) {
-  return {
-    id: String(entry.id || ""),
-    ts: normalizeTs(entry.ts, stableFallbackTs(0)),
-    type: safeTrim(entry.type) || "note",
-    session_id: normalizeSessionId(entry.session_id ?? entry.sessionId ?? entry.session),
-    refs: uniqList(Array.isArray(entry.refs) ? entry.refs : [], 12),
-    summary: summarizeText(entry.text, 240),
-    archivedAt: normalizeTs(archivedAt, nowIso()),
-    source: "archive",
-  };
-}
-
-function parseArchiveIndexText(rawText) {
-  const lines = String(rawText || "").split("\n");
-  const byId = new Map();
-  for (let idx = 0; idx < lines.length; idx += 1) {
-    const line = lines[idx];
-    const trimmed = safeTrim(line);
-    if (!trimmed) {
-      continue;
-    }
-    try {
-      const parsed = JSON.parse(line);
-      const id = safeTrim(parsed.id);
-      if (!id) {
-        continue;
-      }
-      byId.set(id, {
-        id,
-        ts: normalizeTs(parsed.ts, stableFallbackTs(idx)),
-        type: safeTrim(parsed.type) || "note",
-        session_id: normalizeSessionId(parsed.session_id ?? parsed.sessionId ?? parsed.session),
-        refs: uniqList(Array.isArray(parsed.refs) ? parsed.refs : [], 12),
-        summary: summarizeText(parsed.summary ?? parsed.text ?? "", 240),
-        archivedAt: normalizeTs(parsed.archivedAt, stableFallbackTs(idx)),
-        source: "archive",
-      });
-    } catch {
-      // ignore bad archive index lines
-    }
-  }
-  return Array.from(byId.values()).sort((a, b) => String(a.ts || "").localeCompare(String(b.ts || "")));
-}
-
 function normalizeEmbeddingSource(value, fallback = "hot") {
   const clean = safeTrim(value).toLowerCase();
   if (clean === "archive") {
@@ -356,6 +314,7 @@ function normalizeEmbeddingIndexEntry(raw, fallbackTs = stableFallbackTs(0), sou
   const model = safeTrim(src.model) || "unknown";
   const session_id = normalizeSessionId(src.session_id ?? src.sessionId ?? src.session);
   const text_hash = safeTrim(src.text_hash ?? src.textHash);
+  const embedding_version = safeTrim(src.embedding_version ?? src.embeddingVersion);
   return {
     id,
     ts,
@@ -364,6 +323,7 @@ function normalizeEmbeddingIndexEntry(raw, fallbackTs = stableFallbackTs(0), sou
     model,
     dim: vec.length,
     text_hash,
+    embedding_version,
     vec,
   };
 }
@@ -498,6 +458,8 @@ export class ContextFsStorage {
     this.config = config;
     this.baseDir = path.join(workspaceDir, config.contextfsDir);
     this.lockPath = path.join(this.baseDir, ".lock");
+    this.sqliteBootstrapDone = false;
+    this.sqliteVectorBootstrapDone = false;
   }
 
   resolve(name) {
@@ -512,12 +474,23 @@ export class ContextFsStorage {
     await this.ensureFile("summary", this.defaultSummary());
     await this.ensureFile("history", "");
     await this.ensureFile("historyArchive", "");
-    await this.ensureFile("historyArchiveIndex", "");
     await this.ensureFile("historyEmbeddingHot", "");
     await this.ensureFile("historyEmbeddingArchive", "");
     await this.ensureFile("retrievalTraces", "");
     await this.ensureFile("state", JSON.stringify(this.defaultState(), null, 2) + "\n");
 
+    if (this.config?.indexEnabled) {
+      const indexPath = this.resolveIndexPath();
+      try {
+        await fs.access(indexPath);
+      } catch {
+        this.sqliteBootstrapDone = false;
+        this.sqliteVectorBootstrapDone = false;
+      }
+    }
+
+    await this.ensureSqliteInitialized();
+    await this.ensureSqliteVectorInitialized();
     await this.refreshManifest();
   }
 
@@ -530,36 +503,287 @@ export class ContextFsStorage {
     }
   }
 
+  resolveIndexPath() {
+    const rawPath = safeTrim(this.config?.indexPath || "index.sqlite");
+    if (path.isAbsolute(rawPath)) {
+      return rawPath;
+    }
+    return path.join(this.baseDir, rawPath || "index.sqlite");
+  }
+
+  async ensureSqliteInitialized() {
+    if (!this.config?.indexEnabled) {
+      return;
+    }
+    try {
+      const indexPath = this.resolveIndexPath();
+      let existed = true;
+      try {
+        await fs.access(indexPath);
+      } catch {
+        existed = false;
+      }
+
+      const warm = await upsertSqliteTurnRows(this.workspaceDir, this.config, [], {
+        schema_version: "1",
+        updated_at: nowIso(),
+      });
+      if (!warm?.available) {
+        this.sqliteBootstrapDone = true;
+        return;
+      }
+
+      const doctor = await sqliteIndexDoctor(this.workspaceDir, this.config);
+      if (!doctor?.available) {
+        this.sqliteBootstrapDone = true;
+        return;
+      }
+      const currentTurns = Number(doctor.turns || 0);
+      const archiveRows = await this.readHistoryArchive();
+      const hotRows = await this.readHistory();
+      const expectedTurns = archiveRows.length + hotRows.length;
+      const shouldBackfill = !existed || currentTurns === 0 || (expectedTurns > 0 && currentTurns < expectedTurns);
+      if (!shouldBackfill) {
+        this.sqliteBootstrapDone = true;
+        return;
+      }
+
+      if (archiveRows.length) {
+        await this.tryUpsertSqliteRows(archiveRows, "archive");
+      }
+      if (hotRows.length) {
+        await this.tryUpsertSqliteRows(hotRows, "hot");
+      }
+      this.sqliteBootstrapDone = true;
+    } catch (err) {
+      if (this.config?.debug) {
+        console.error(`[contextfs] failed to ensure sqlite initialization: ${String(err?.message || err)}`);
+      }
+    }
+  }
+
+  async ensureSqliteVectorInitialized() {
+    if (!this.config?.indexEnabled) {
+      return;
+    }
+    if (!this.config?.vectorEnabled || String(this.config?.retrievalMode || "").toLowerCase() !== "hybrid") {
+      this.sqliteVectorBootstrapDone = true;
+      return;
+    }
+    try {
+      const doctor = await sqliteIndexDoctor(this.workspaceDir, this.config);
+      if (!doctor?.available) {
+        return;
+      }
+      const turnCount = Number(doctor.turns || 0);
+      if (turnCount <= 0) {
+        return;
+      }
+      const vectorAvailable = Boolean(doctor.vector?.available);
+      const vectorRows = Number(doctor.vector?.rows || 0);
+      if (vectorAvailable && vectorRows >= turnCount) {
+        this.sqliteVectorBootstrapDone = true;
+        return;
+      }
+
+      const rows = await this.readHistoryEmbeddingView("all");
+      if (!rows.length) {
+        return;
+      }
+      const result = await this.tryUpsertSqliteVectorRows(rows);
+      if (!result?.available) {
+        return;
+      }
+      const after = await sqliteIndexDoctor(this.workspaceDir, this.config);
+      if (after?.available && after.vector?.available) {
+        this.sqliteVectorBootstrapDone = true;
+      }
+    } catch (err) {
+      if (this.config?.debug) {
+        console.error(`[contextfs] failed to ensure sqlite vector initialization: ${String(err?.message || err)}`);
+      }
+    }
+  }
+
   async buildEmbeddingRowsForEntries(entries, source = "hot") {
     const provider = createEmbeddingProvider(this.config);
     if (!provider.enabled) {
       return [];
     }
     const list = Array.isArray(entries) ? entries : [];
-    const rows = [];
+    const normalizedRows = [];
     for (const entry of list) {
       const normalized = normalizeEntry(entry, nowIso());
       const text = normalizeEmbeddingText(normalized.text, this.config.embeddingTextMaxChars);
       if (!text) {
         continue;
       }
-      const embedded = await provider.embedText(text);
+      normalizedRows.push({
+        normalized,
+        text,
+      });
+    }
+    if (!normalizedRows.length) {
+      return [];
+    }
+    const embeddedRows = await embedTexts(provider, normalizedRows.map((item) => item.text), {
+      batchSize: this.config.embeddingBatchSize,
+    });
+    const rows = [];
+    for (let i = 0; i < normalizedRows.length; i += 1) {
+      const item = normalizedRows[i];
+      const embedded = embeddedRows[i];
+      if (!embedded) {
+        continue;
+      }
+      const text = item.text;
       const vec = normalizeEmbeddingVector(embedded.vector, embedded.dim || provider.dim);
       if (!vec.length) {
         continue;
       }
       rows.push({
-        id: String(normalized.id || ""),
-        ts: normalizeTs(normalized.ts, nowIso()),
-        session_id: normalizeSessionId(normalized.session_id),
+        id: String(item.normalized.id || ""),
+        ts: normalizeTs(item.normalized.ts, nowIso()),
+        session_id: normalizeSessionId(item.normalized.session_id),
         source: normalizeEmbeddingSource(source),
         model: safeTrim(embedded.model) || safeTrim(provider.model) || "unknown",
         dim: vec.length,
         text_hash: safeTrim(embedded.text_hash) || hashEmbeddingText(text),
+        embedding_version: safeTrim(embedded.embedding_version),
         vec,
       });
     }
     return rows.filter((item) => Boolean(item.id));
+  }
+
+  async tryUpsertSqliteRows(entries, source = "hot") {
+    try {
+      const list = Array.isArray(entries) ? entries : [];
+      if (!list.length) {
+        return { upserted: 0, available: true, reason: "no_rows" };
+      }
+      const rows = list
+        .map((entry) => toSqliteTurnRow(entry, source, {
+          summaryMaxChars: this.config.searchSummaryMaxChars,
+          previewMaxChars: this.config.embeddingTextMaxChars,
+        }))
+        .filter((row) => Boolean(safeTrim(row.id)));
+      if (!rows.length) {
+        return { upserted: 0, available: true, reason: "no_valid_rows" };
+      }
+      const maxRetries = 3;
+      for (let attempt = 0; attempt <= maxRetries; attempt += 1) {
+        try {
+          const result = await upsertSqliteTurnRows(this.workspaceDir, this.config, rows, {
+            schema_version: "1",
+            updated_at: nowIso(),
+          });
+          const payload = {
+            upserted: Number(result?.upserted || 0),
+            available: Boolean(result?.available),
+            reason: String(result?.reason || ""),
+          };
+          return payload;
+        } catch (err) {
+          const retryable = isRetryableSqliteWriteError(err);
+          const last = attempt >= maxRetries;
+          if (!retryable || last) {
+            throw err;
+          }
+          await sleepMs(10 + attempt * 15);
+        }
+      }
+      return {
+        upserted: 0,
+        available: false,
+        reason: "retry_exhausted",
+      };
+    } catch (err) {
+      if (this.config?.debug) {
+        console.error(`[contextfs] failed to upsert sqlite rows: ${String(err?.message || err)}`);
+      }
+      this.sqliteBootstrapDone = false;
+      return {
+        upserted: 0,
+        available: false,
+        reason: String(err?.message || err),
+      };
+    }
+  }
+
+  async tryUpsertSqliteVectorRows(rows, meta = {}) {
+    try {
+      const list = Array.isArray(rows) ? rows : [];
+      if (!list.length) {
+        return {
+          upserted: 0,
+          available: true,
+          reason: "no_rows",
+        };
+      }
+      const maxRetries = 3;
+      for (let attempt = 0; attempt <= maxRetries; attempt += 1) {
+        try {
+          const result = await upsertSqliteVectorRows(this.workspaceDir, this.config, list, meta);
+          return {
+            upserted: Number(result?.upserted || 0),
+            available: Boolean(result?.available),
+            reason: String(result?.reason || ""),
+            dim: Number(result?.dim || 0),
+            embedding_version: String(result?.embedding_version || ""),
+          };
+        } catch (err) {
+          const retryable = isRetryableSqliteWriteError(err);
+          const last = attempt >= maxRetries;
+          if (!retryable || last) {
+            throw err;
+          }
+          await sleepMs(10 + attempt * 15);
+        }
+      }
+      return {
+        upserted: 0,
+        available: false,
+        reason: "retry_exhausted",
+      };
+    } catch (err) {
+      if (this.config?.debug) {
+        console.error(`[contextfs] failed to upsert sqlite vectors: ${String(err?.message || err)}`);
+      }
+      return {
+        upserted: 0,
+        available: false,
+        reason: String(err?.message || err),
+      };
+    }
+  }
+
+  async tryPruneSqliteVectorRowsByIds(ids) {
+    try {
+      const list = Array.isArray(ids) ? ids.map((id) => String(id || "")).filter(Boolean) : [];
+      if (!list.length) {
+        return {
+          removed: 0,
+          available: true,
+          reason: "no_ids",
+        };
+      }
+      const result = await pruneSqliteVectorRowsByTurnIds(this.workspaceDir, this.config, list);
+      return {
+        removed: Number(result?.removed || 0),
+        available: Boolean(result?.available),
+        reason: String(result?.reason || ""),
+      };
+    } catch (err) {
+      if (this.config?.debug) {
+        console.error(`[contextfs] failed to prune sqlite vectors: ${String(err?.message || err)}`);
+      }
+      return {
+        removed: 0,
+        available: false,
+        reason: String(err?.message || err),
+      };
+    }
   }
 
   async tryUpsertEmbeddingRows(entries, source = "hot", options = {}) {
@@ -574,6 +798,7 @@ export class ContextFsStorage {
       if (!options.locked) {
         await this.compactEmbeddingIndexesIfNeeded();
       }
+      await this.tryUpsertSqliteVectorRows(rows);
       return rows.length;
     } catch (err) {
       if (this.config?.debug) {
@@ -1020,14 +1245,6 @@ export class ContextFsStorage {
     return parsed.entries;
   }
 
-  async readHistoryArchiveIndex() {
-    const raw = await this.readText("historyArchiveIndex");
-    if (!safeTrim(raw)) {
-      return [];
-    }
-    return parseArchiveIndexText(raw);
-  }
-
   async readHistoryEmbeddingHot() {
     const raw = await this.readText("historyEmbeddingHot");
     if (!safeTrim(raw)) {
@@ -1068,28 +1285,6 @@ export class ContextFsStorage {
       });
     }
     return Array.from(byId.values()).sort((a, b) => String(a.ts || "").localeCompare(String(b.ts || "")));
-  }
-
-  async rebuildHistoryArchiveIndex(options = {}) {
-    const lock = options.locked ? null : await this.acquireLock();
-    try {
-      const rawArchive = await this.readText("historyArchive");
-      const parsed = parseArchiveTextPreserveIds(rawArchive);
-      const entries = parsed.entries;
-      const archivedAt = options.archivedAt || nowIso();
-      const indexEntries = entries.map((entry) => toArchiveIndexEntry(entry, archivedAt));
-      const payload = serializeHistoryEntries(indexEntries);
-      await this.writeTextWithLock("historyArchiveIndex", payload);
-      return {
-        rebuilt: true,
-        archiveEntries: entries.length,
-        indexEntries: indexEntries.length,
-      };
-    } finally {
-      if (lock) {
-        await this.releaseLock(lock);
-      }
-    }
   }
 
   async findHistoryArchiveById(id) {
@@ -1362,6 +1557,13 @@ export class ContextFsStorage {
     if (!updated) {
       return null;
     }
+    await this.tryUpsertSqliteRows([updated], "hot");
+    const text = normalizeEmbeddingText(updated.text, this.config.embeddingTextMaxChars);
+    if (!text) {
+      await this.pruneHistoryEmbeddingByIds([updated.id]);
+      await this.tryPruneSqliteVectorRowsByIds([updated.id]);
+      return updated;
+    }
     await this.tryUpsertEmbeddingRows([updated], "hot");
     return updated;
   }
@@ -1382,6 +1584,7 @@ export class ContextFsStorage {
     if (!normalized) {
       return null;
     }
+    await this.tryUpsertSqliteRows([normalized], "hot");
     await this.tryUpsertEmbeddingRows([normalized], "hot");
     return normalized;
   }
@@ -1392,14 +1595,10 @@ export class ContextFsStorage {
       return [];
     }
     const normalized = normalizeHistoryItems(list);
-    const archivedAt = options.archivedAt || nowIso();
     const payload = `${normalized.map((item) => JSON.stringify(item)).join("\n")}\n`;
-    const indexPayload = `${normalized
-      .map((item) => JSON.stringify(toArchiveIndexEntry(item, archivedAt)))
-      .join("\n")}\n`;
     const write = async () => {
       await fs.appendFile(this.resolve("historyArchive"), payload, "utf8");
-      await fs.appendFile(this.resolve("historyArchiveIndex"), indexPayload, "utf8");
+      await this.tryUpsertSqliteRows(normalized, "archive");
       await this.tryUpsertEmbeddingRows(normalized, "archive", { locked: true });
       return normalized;
     };
@@ -1428,9 +1627,9 @@ export class ContextFsStorage {
       "- summary.md | rolling compact summary | tags: memory,compact",
       "- history.ndjson | compactable turn history | tags: runtime,history",
       "- history.archive.ndjson | archived compacted turn history | tags: runtime,archive",
-      "- history.archive.index.ndjson | archive retrieval index | tags: runtime,index",
       "- history.embedding.hot.ndjson | hot retrieval embedding index | tags: runtime,vector,hot",
       "- history.embedding.archive.ndjson | archive retrieval embedding index | tags: runtime,vector,archive",
+      "- index.sqlite | sqlite lexical/vector derived index | tags: runtime,index,derived",
       "- retrieval.traces.ndjson | retrieval trace log (derived) | tags: runtime,trace",
       "",
       "## mode",

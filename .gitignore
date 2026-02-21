@@ -2,3 +2,5 @@
 .contextfs/
 docs/
 nul
+.opencode/plugins/contextfs/.env*
+!.opencode/plugins/contextfs/.env.example

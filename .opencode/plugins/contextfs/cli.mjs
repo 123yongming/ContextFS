@@ -5,8 +5,10 @@ import { mergeConfig } from "./src/config.mjs";
 import { ContextFsStorage } from "./src/storage.mjs";
 import { runCtxCommand } from "./src/commands.mjs";
 import { buildContextPack } from "./src/packer.mjs";
+import { loadContextFsEnv } from "./src/env.mjs";
 
 async function main() {
+  await loadContextFsEnv();
   const args = process.argv.slice(2);
   const cwd = process.cwd();
   const config = mergeConfig();

@@ -8,6 +8,7 @@ import { maybeCompact } from "./contextfs/src/compactor.mjs";
 import { buildContextPack } from "./contextfs/src/packer.mjs";
 import { addPinsFromText } from "./contextfs/src/pins.mjs";
 import { runCtxCommand } from "./contextfs/src/commands.mjs";
+import { loadContextFsEnv } from "./contextfs/src/env.mjs";
 
 function dbg(workspaceDir, enabled, msg, obj) {
   if (!enabled) {
@@ -159,6 +160,7 @@ async function recordTurn(storage, role, text, sessionId) {
 }
 
 export const ContextFSPlugin = async ({ directory }) => {
+  await loadContextFsEnv();
   const config = mergeConfig(globalThis.CONTEXTFS_CONFIG || {});
   const workspaceDir = directory || process.cwd();
   const debugEnabled = Boolean(config.debug) || process.env.CONTEXTFS_DEBUG === "1";

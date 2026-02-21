@@ -64,8 +64,12 @@ export async function searchRecords(args, storage, config) {
   }
   const k = clampInt(args?.k, Number(config?.searchDefaultK || 5), 1, 50);
   const scope = normalizeScope(args?.scope);
+  const mode = String(args?.mode ?? "").trim().toLowerCase();
   const session = normalizeSession(args?.session, args?.session_id);
   const argv = ["ctx", "search", query, "--k", String(k), "--scope", scope, "--json"];
+  if (mode) {
+    argv.push("--mode", mode);
+  }
   pushSessionArgv(argv, session);
   return runJsonCtx(argv, storage, config, "search");
 }
