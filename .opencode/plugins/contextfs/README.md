@@ -19,10 +19,11 @@ Small, non-invasive OpenCode plugin to keep long sessions stable.
   - RETRIEVAL_INDEX (max 8 items; derived from last search)
   - WORKSET (recent 6 turns)
 
-- **Auto Compaction**: Triggers when tokens > threshold (default 8000)
-  - Compresses old history into summary
+- **Auto Compaction**: Triggers when tokens > threshold (default 16000)
+  - Compresses old history into summary via external compact model API
   - Keeps recent N turns intact
   - Bounded context size
+  - If compact summary API call fails, compaction fails (no local fallback)
 
 - **Pins Management**: Manual pins with deduplication
 
@@ -85,6 +86,13 @@ Use progressive retrieval to stay token-efficient:
 
 Pack remains reference-first: retrieval index rows are included, not full detail payloads.
 
+## Lexical Index Field Semantics
+
+- `summary` is a compact display field for L0/UI and short context labels.
+- `text_preview` is the lexical retrieval field and is generated as a bounded segmented preview to retain head/middle/tail semantics for long turns.
+- `refs` remains a separate lexical signal for structured references (paths, urls, symbols).
+- If preview generation behavior changes in a deployed workspace, run `ctx reindex --full` once to backfill existing SQLite lexical rows.
+
 ## Configuration
 
 Default config in `src/config.mjs`. Override via:
@@ -95,11 +103,24 @@ globalThis.CONTEXTFS_CONFIG = {
   autoInject: true,
   autoCompact: true,
   recentTurns: 6,
-  tokenThreshold: 8000,
+  tokenThreshold: 16000,
   pinsMaxItems: 20,
   summaryMaxChars: 3200,
   manifestMaxLines: 20,
+  compactModel: "Pro/Qwen/Qwen2.5-7B-Instruct",
+  compactTimeoutMs: 20000,
+  compactMaxRetries: 2,
 }
+```
+
+Environment variables for compact summary model:
+
+```bash
+CONTEXTFS_EMBEDDING_BASE_URL=https://api.siliconflow.cn/v1
+CONTEXTFS_EMBEDDING_API_KEY=<your_api_key>
+CONTEXTFS_COMPACT_MODEL=Pro/Qwen/Qwen2.5-7B-Instruct
+CONTEXTFS_COMPACT_TIMEOUT_MS=20000
+CONTEXTFS_COMPACT_MAX_RETRIES=2
 ```
 
 ## Context Pack Format
@@ -135,7 +156,6 @@ npm run test:regression     # Regression tests (repo root)
 │   ├─ compactor.mjs (compression)    │
 │   ├─ packer.mjs    (pack builder)   │
 │   ├─ pins.mjs      (pin dedupe)     │
-│   ├─ summary.mjs   (summary merge)  │
 │   ├─ token.mjs     (token estimate) │
 │   └─ commands.mjs  (CLI impl)       │
 └─────────────────────────────────────┘

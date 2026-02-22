@@ -32,6 +32,41 @@ function lineSummary(text, maxChars = 240) {
   return `${oneLine.slice(0, Math.max(0, maxChars - 3))}...`;
 }
 
+function buildSegmentedPreview(text, maxChars = 1200) {
+  const oneLine = String(text || "").replace(/\s+/g, " ").trim();
+  const budget = clampInt(maxChars, 1200, 80, 12000);
+  if (oneLine.length <= budget) {
+    return oneLine;
+  }
+
+  const separator = " ... ";
+  const segmentCount = clampInt(Math.floor(budget / 120), 3, 3, 8);
+  const totalSeparatorChars = separator.length * (segmentCount - 1);
+  const availableChars = Math.max(1, budget - totalSeparatorChars);
+  const segmentLength = Math.max(16, Math.floor(availableChars / segmentCount));
+  const maxStart = Math.max(0, oneLine.length - segmentLength);
+
+  const segments = [];
+  for (let i = 0; i < segmentCount; i += 1) {
+    const ratio = segmentCount === 1 ? 0 : i / (segmentCount - 1);
+    const start = Math.floor(maxStart * ratio);
+    const piece = oneLine.slice(start, start + segmentLength).trim();
+    if (!piece || segments[segments.length - 1] === piece) {
+      continue;
+    }
+    segments.push(piece);
+  }
+
+  if (!segments.length) {
+    return lineSummary(oneLine, budget);
+  }
+  const combined = segments.join(separator);
+  if (combined.length <= budget) {
+    return combined;
+  }
+  return lineSummary(combined, budget);
+}
+
 function safeJsonStringify(value, fallback = "[]") {
   try {
     return JSON.stringify(value);
@@ -583,7 +618,7 @@ export function toSqliteTurnRow(entry, source = "hot", options = {}) {
     refs_json: safeJsonStringify(refs),
     refs_fts: refs.join(" "),
     summary: lineSummary(item.summary ?? textSource, summaryMaxChars),
-    text_preview: lineSummary(textSource, previewMaxChars),
+    text_preview: buildSegmentedPreview(textSource, previewMaxChars),
   };
 }
 

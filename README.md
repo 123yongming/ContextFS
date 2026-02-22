@@ -25,7 +25,7 @@ ContextFS 是一个给 OpenCode 用的轻量上下文管理插件，目标很简
 - **向量语义检索**：基于 `sqlite-vec` 的向量搜索，支持 ANN 近似最近邻
 - **混合检索模式**：词法 + 语义融合，RRF 排序
 - 渐进式检索流程：`search -> timeline -> get`
-- 自动压缩：对话过长时自动收敛上下文体积
+- 自动压缩：对话过长时自动收敛上下文体积（summary 通过外部大模型生成，失败即报错，不做本地降级）
 
 ## 快速开始
 
@@ -233,6 +233,16 @@ cp .opencode/plugins/contextfs/.env.example .opencode/plugins/contextfs/.env
 | 压缩次数 | 15 | 0 |
 
 **结论**：ContextFS 实现 **O(1) token 增长**，以约 55ms/轮的额外开销换取 98.7% 的 token 压缩。
+
+## Lexical Index Notes
+
+- `summary` is kept as a compact L0/UI display field.
+- `text_preview` is used for lexical recall and stores a bounded segmented preview to retain more long-turn semantics.
+- If `text_preview` generation changes after upgrade, run one rebuild to backfill old rows:
+
+```bash
+/ctx reindex --full
+```
 
 ## License
 
