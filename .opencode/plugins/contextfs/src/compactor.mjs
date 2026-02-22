@@ -253,8 +253,9 @@ function countHistoryTokens(history) {
 }
 
 export async function maybeCompact(storage, config, force = false) {
-  const lock = await storage.acquireLock();
-  let result;
+  // Phase 1: Gather data and determine compaction need (under lock)
+  let phase1Result;
+  const lock1 = await storage.acquireLock();
   try {
     const history = await storage.readHistory({ migrate: false });
     const pins = await storage.readText("pins");
@@ -264,64 +265,99 @@ export async function maybeCompact(storage, config, force = false) {
     const threshold = config.tokenThreshold;
     const shouldCompact = force || (config.autoCompact && total > threshold);
     if (!shouldCompact) {
-      result = {
+      return {
         compacted: false,
         beforeTokens: total,
         afterTokens: total,
         compactedTurns: 0,
       };
-    } else {
-      const keep = Math.max(1, Number(config.recentTurns || 6));
-      const splitIndex = Math.max(0, history.length - keep);
-      const oldTurns = history.slice(0, splitIndex);
-      const recentTurns = history.slice(splitIndex);
-
-      if (!oldTurns.length && !force) {
-        result = {
-          compacted: false,
-          beforeTokens: total,
-          afterTokens: total,
-          compactedTurns: 0,
-        };
-      } else {
-        const merged = oldTurns.length
-          ? await buildCompactSummaryWithModel(summary, oldTurns, config).catch((err) => {
-              throw new Error(`compact summary generation failed: ${String(err?.message || err)}`);
-            })
-          : summary;
-        const now = new Date().toISOString();
-        const historyText = recentTurns.map((item) => JSON.stringify(item)).join("\n");
-
-        await storage.appendHistoryArchive(oldTurns, { locked: true, archivedAt: now });
-        await storage.writeTextWithLock("summary", merged);
-        await storage.writeTextWithLock("history", historyText ? `${historyText}\n` : "");
-
-        const currentState = await storage.readState();
-        const nextState = {
-          ...currentState,
-          revision: (currentState.revision || 0) + 1,
-          updatedAt: now,
-          lastCompactedAt: now,
-          compactCount: (currentState.compactCount || 0) + 1,
-          lastPackTokens: countHistoryTokens(recentTurns) + estimateTokens(pins) + estimateTokens(merged),
-        };
-        await storage.writeTextWithLock("state", JSON.stringify(nextState, null, 2) + "\n");
-
-        result = {
-          compacted: true,
-          beforeTokens: total,
-          afterTokens: nextState.lastPackTokens,
-          compactedTurns: oldTurns.length,
-          keptTurns: recentTurns.length,
-        };
-      }
     }
+
+    const keep = Math.max(1, Number(config.recentTurns || 6));
+    const splitIndex = Math.max(0, history.length - keep);
+    const oldTurns = history.slice(0, splitIndex);
+    const recentTurns = history.slice(splitIndex);
+    const oldTurnIds = new Set(oldTurns.map((t) => t.id));
+    phase1Result = {
+      shouldCompact: true,
+      total,
+      oldTurns,
+      recentTurns,
+      oldTurnIds,
+      summary,
+      pins,
+      keep,
+    };
+
   } finally {
-    await storage.releaseLock(lock);
+    await storage.releaseLock(lock1);
   }
 
-  if (result?.compacted) {
-    await storage.refreshManifest();
+  // Phase 2: External API call for summary generation (without lock)
+  if (!phase1Result.oldTurns.length && !force) {
+    return {
+      compacted: false,
+      beforeTokens: phase1Result.total,
+      afterTokens: phase1Result.total,
+      compactedTurns: 0,
+    };
   }
-  return result;
+
+  // Build merged summary outside of lock to avoid blocking concurrent writes
+  let merged;
+  if (phase1Result.oldTurns.length) {
+    merged = await buildCompactSummaryWithModel(
+      phase1Result.summary,
+      phase1Result.oldTurns,
+      config
+    ).catch((err) => {
+      throw new Error(`compact summary generation failed: ${String(err?.message || err)}`);
+    });
+  } else {
+    merged = phase1Result.summary;
+  }
+
+  // Phase 3: Write results (under lock)
+  const lock2 = await storage.acquireLock();
+  try {
+    // Re-read history to preserve any turns appended during Phase 2
+    const currentHistory = await storage.readHistory({ migrate: false });
+    const newTurnsDuringFetch = currentHistory.filter(
+      (t) => !phase1Result.oldTurnIds.has(t.id)
+    );
+
+    const now = new Date().toISOString();
+    const historyText = newTurnsDuringFetch.map((item) => JSON.stringify(item)).join("\n");
+
+    await storage.appendHistoryArchive(phase1Result.oldTurns, { locked: true, archivedAt: now });
+    await storage.writeTextWithLock("summary", merged);
+    await storage.writeTextWithLock("history", historyText ? `${historyText}\n` : "");
+
+    const currentPins = await storage.readText("pins");
+    const currentState = await storage.readState();
+    const nextState = {
+      ...currentState,
+      revision: (currentState.revision || 0) + 1,
+      updatedAt: now,
+      lastCompactedAt: now,
+      compactCount: (currentState.compactCount || 0) + 1,
+      lastPackTokens:
+        countHistoryTokens(newTurnsDuringFetch) +
+        estimateTokens(currentPins) +
+        estimateTokens(merged),
+    };
+    await storage.writeTextWithLock("state", JSON.stringify(nextState, null, 2) + "\n");
+
+    const result = {
+      compacted: true,
+      beforeTokens: phase1Result.total,
+      afterTokens: nextState.lastPackTokens,
+      compactedTurns: phase1Result.oldTurns.length,
+      keptTurns: newTurnsDuringFetch.length,
+    };
+
+    return result;
+  } finally {
+    await storage.releaseLock(lock2);
+  }
 }

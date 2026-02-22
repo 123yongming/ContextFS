@@ -1002,6 +1002,74 @@ test("maybeCompact throws when external compact summary request fails", async ()
   });
 });
 
+test("maybeCompact preserves turns appended during slow external API call", async () => {
+  await withTempStorage(async ({ storage, config }) => {
+    const localConfig = { ...config, recentTurns: 2, tokenThreshold: 1, autoCompact: true };
+    for (let i = 1; i <= 5; i += 1) {
+      await storage.appendHistory({
+        role: "user",
+        text: `old-${i}`,
+        ts: new Date().toISOString(),
+      });
+    }
+
+    // Mock slow external API call
+    const previousFetch = globalThis.fetch;
+    let fetchStarted = false;
+    globalThis.fetch = async (url, init) => {
+      const target = String(url || "");
+      if (target.endsWith("/chat/completions")) {
+        fetchStarted = true;
+        // Simulate slow API - 600ms delay
+        await new Promise((resolve) => setTimeout(resolve, 600));
+        return {
+          ok: true,
+          status: 200,
+          async json() {
+            return {
+              choices: [{ message: { content: "- compacted summary" } }],
+            };
+          },
+        };
+      }
+      if (typeof previousFetch === "function") {
+        return previousFetch(url, init);
+      }
+      throw new Error(`unexpected fetch in test: ${target || "<empty>"}`);
+    };
+
+    let compactPromise;
+    try {
+      compactPromise = maybeCompact(storage, localConfig, true);
+
+      // Wait for fetch to start, then append during the slow API call
+      await new Promise((resolve) => {
+        const check = () => {
+          if (fetchStarted) resolve();
+          else setTimeout(check, 10);
+        };
+        check();
+      });
+
+      // Append a new turn while the external API is still processing
+      await storage.appendHistory({
+        role: "assistant",
+        text: "NEW-DURING-FETCH",
+        ts: new Date().toISOString(),
+      });
+
+      await compactPromise;
+    } finally {
+      globalThis.fetch = previousFetch;
+    }
+
+    const history = await storage.readHistory();
+    const hasNewTurn = history.some((item) => item.text === "NEW-DURING-FETCH");
+    assert.ok(hasNewTurn, "NEW-DURING-FETCH should be preserved after compaction");
+  });
+});
+
+
 test("compacted turns remain retrievable via archive fallback", async () => {
   await withTempStorage(async ({ storage, config, workspaceDir }) => {
     const localConfig = {
