@@ -13,7 +13,7 @@ import { createEmbeddingProvider, hashEmbeddingText, normalizeEmbeddingText } fr
 import { loadContextFsEnv } from "../src/env.mjs";
 import { ContextFsStorage } from "../src/storage.mjs";
 import { runCtxCommand } from "../src/commands.mjs";
-import { sqliteIndexDoctor } from "../src/index/sqlite_store.mjs";
+import { searchSqliteLexical, sqliteIndexDoctor, toSqliteTurnRow } from "../src/index/sqlite_store.mjs";
 test("estimateTokens is stable and monotonic", () => {
   const a = estimateTokens("abcd");
   const b = estimateTokens("abcdefgh");
@@ -279,6 +279,119 @@ async function hasSqliteDriver() {
     return false;
   }
 }
+
+test("toSqliteTurnRow keeps short summary but builds semantic-dense text_preview", () => {
+  const longText = [
+    "HEAD_MARKER",
+    "A".repeat(480),
+    "MIDDLE_MARKER",
+    "B".repeat(480),
+    "TAIL_MARKER",
+  ].join(" ");
+
+  const row = toSqliteTurnRow(
+    {
+      id: "H-preview-1",
+      ts: "2026-02-22T00:00:00.000Z",
+      role: "user",
+      type: "query",
+      text: longText,
+    },
+    "hot",
+    {
+      summaryMaxChars: 80,
+      previewMaxChars: 220,
+    },
+  );
+
+  assert.ok(row.summary.includes("HEAD_MARKER"));
+  assert.equal(row.summary.includes("TAIL_MARKER"), false);
+  assert.ok(row.text_preview.includes("HEAD_MARKER"));
+  assert.ok(row.text_preview.includes("MIDDLE_MARKER"));
+  assert.ok(row.text_preview.includes("TAIL_MARKER"));
+  assert.ok(row.text_preview.length <= 223);
+  assert.equal(row.text_preview.includes("\n"), false);
+});
+
+test("searchSqliteLexical can hit a tail token beyond preview head budget", async (t) => {
+  if (!(await hasSqliteDriver())) {
+    t.skip("better-sqlite3 unavailable in this environment");
+    return;
+  }
+  await withTempStorage(async ({ storage, config, workspaceDir }) => {
+    const localConfig = mergeConfig({
+      ...config,
+      embeddingTextMaxChars: 220,
+      searchModeDefault: "lexical",
+      retrievalMode: "lexical",
+      vectorEnabled: false,
+    });
+    storage.config = localConfig;
+
+    const uniqueTailToken = "UNIQUE_TAIL_TOKEN_9f7a1";
+    const longText = [
+      "HEAD_ALPHA",
+      "X".repeat(900),
+      "MIDDLE_BETA",
+      "Y".repeat(900),
+      uniqueTailToken,
+    ].join(" ");
+
+    const saved = await storage.appendHistory({
+      role: "user",
+      text: longText,
+      ts: "2026-02-22T00:01:00.000Z",
+    });
+
+    const out = await searchSqliteLexical(workspaceDir, localConfig, {
+      query: uniqueTailToken,
+      k: 5,
+      scope: "all",
+    });
+    if (!out.available) {
+      t.skip(`sqlite lexical unavailable: ${String(out.reason || "unknown")}`);
+      return;
+    }
+    assert.ok(out.rows.some((row) => String(row.id) === String(saved.id)));
+  });
+});
+
+test("toSqliteTurnRow text_preview is deterministic and always within budget", () => {
+  const src = `prefix ${"Z".repeat(3000)} suffix`;
+
+  const rowA = toSqliteTurnRow(
+    {
+      id: "H-det-1",
+      ts: "2026-02-22T00:02:00.000Z",
+      role: "user",
+      type: "query",
+      text: src,
+    },
+    "hot",
+    {
+      summaryMaxChars: 100,
+      previewMaxChars: 300,
+    },
+  );
+  const rowB = toSqliteTurnRow(
+    {
+      id: "H-det-2",
+      ts: "2026-02-22T00:02:01.000Z",
+      role: "user",
+      type: "query",
+      text: src,
+    },
+    "hot",
+    {
+      summaryMaxChars: 100,
+      previewMaxChars: 300,
+    },
+  );
+
+  assert.equal(rowA.text_preview.length <= 303, true);
+  assert.equal(rowA.text_preview.includes("\n"), false);
+  assert.equal(rowA.text_preview, rowB.text_preview);
+});
 
 async function fileExists(targetPath) {
   try {

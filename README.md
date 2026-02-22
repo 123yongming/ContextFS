@@ -234,6 +234,16 @@ cp .opencode/plugins/contextfs/.env.example .opencode/plugins/contextfs/.env
 
 **结论**：ContextFS 实现 **O(1) token 增长**，以约 55ms/轮的额外开销换取 98.7% 的 token 压缩。
 
+## Lexical Index Notes
+
+- `summary` is kept as a compact L0/UI display field.
+- `text_preview` is used for lexical recall and stores a bounded segmented preview to retain more long-turn semantics.
+- If `text_preview` generation changes after upgrade, run one rebuild to backfill old rows:
+
+```bash
+/ctx reindex --full
+```
+
 ## License
 
 MIT

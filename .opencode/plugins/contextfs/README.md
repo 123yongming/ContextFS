@@ -86,6 +86,13 @@ Use progressive retrieval to stay token-efficient:
 
 Pack remains reference-first: retrieval index rows are included, not full detail payloads.
 
+## Lexical Index Field Semantics
+
+- `summary` is a compact display field for L0/UI and short context labels.
+- `text_preview` is the lexical retrieval field and is generated as a bounded segmented preview to retain head/middle/tail semantics for long turns.
+- `refs` remains a separate lexical signal for structured references (paths, urls, symbols).
+- If preview generation behavior changes in a deployed workspace, run `ctx reindex --full` once to backfill existing SQLite lexical rows.
+
 ## Configuration
 
 Default config in `src/config.mjs`. Override via:

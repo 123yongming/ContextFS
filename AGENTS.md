@@ -138,6 +138,9 @@ Preferred interactive mode (OpenCode chat): `/ctx ...`.
 ### Retrieval / Index Notes
 - `history*.ndjson` is source-of-truth data.
 - `index.sqlite` is derived index data for lexical/vector retrieval.
+- Keep `summary` UI-oriented and compact; keep lexical recall density in `text_preview`.
+- `text_preview` should preserve semantic coverage across long turns (not only head truncation) while staying single-line and bounded.
+- After changing `text_preview` generation, run `ctx reindex --full` to backfill existing lexical rows.
 - Do not assume sqlite row count equality implies semantic parity; use `ctx doctor` and reindex paths where needed.
 
 ## 7) Test Scope by Change Type
