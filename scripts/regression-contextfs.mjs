@@ -10,6 +10,48 @@ import { parsePinsMarkdown } from "../.opencode/plugins/contextfs/src/pins.mjs";
 import { buildContextPack } from "../.opencode/plugins/contextfs/src/packer.mjs";
 
 const root = process.cwd();
+const TEST_COMPACT_MODEL = "Pro/Qwen/Qwen2.5-7B-Instruct";
+
+function installCompactFetchMock() {
+  const previousFetch = globalThis.fetch;
+  globalThis.fetch = async (url, init) => {
+    const target = String(url || "");
+    if (target.endsWith("/chat/completions")) {
+      let prompt = "";
+      try {
+        const parsed = JSON.parse(String(init?.body || "{}"));
+        prompt = String(parsed?.messages?.[1]?.content || "");
+      } catch {
+        prompt = "";
+      }
+      const sample = prompt
+        .split("\n")
+        .find((line) => line.includes("[USER]") || line.includes("[ASSISTANT]") || line.includes("[SYSTEM]"));
+      return {
+        ok: true,
+        status: 200,
+        async json() {
+          return {
+            choices: [
+              {
+                message: {
+                  content: `# Rolling Summary\n\n- compacted by external model\n- ${sample || "regression summary"}\n`,
+                },
+              },
+            ],
+          };
+        },
+      };
+    }
+    if (typeof previousFetch === "function") {
+      return previousFetch(url, init);
+    }
+    throw new Error(`unexpected fetch in regression: ${target || "<empty>"}`);
+  };
+  return () => {
+    globalThis.fetch = previousFetch;
+  };
+}
 
 function parseTokens(text) {
   const before = Number((text.match(/before.tokens: (\d+)/) || [])[1] || 0);
@@ -29,7 +71,7 @@ async function test1() {
   const config = mergeConfig({
     contextfsDir: ".contextfs",
     recentTurns: 6,
-    tokenThreshold: 8000,
+    tokenThreshold: 16000,
     autoInject: true,
     autoCompact: true,
   });
@@ -426,11 +468,43 @@ function printTable(results) {
 }
 
 async function main() {
-  const results = [await test1(), await test2(), await test3(), await test4(), await test5(), await test6(), await test7(), await test8()];
-  printTable(results);
-  console.log("\n# JSON Summary\n");
-  console.log(JSON.stringify({ allPass: results.every((x) => x.pass), results }, null, 2));
-  process.exitCode = results.every((x) => x.pass) ? 0 : 1;
+  const previousCompactModel = process.env.CONTEXTFS_COMPACT_MODEL;
+  const previousApiKey = process.env.CONTEXTFS_EMBEDDING_API_KEY;
+  const previousBaseUrl = process.env.CONTEXTFS_EMBEDDING_BASE_URL;
+  const restoreFetch = installCompactFetchMock();
+  if (!String(process.env.CONTEXTFS_COMPACT_MODEL || "").trim()) {
+    process.env.CONTEXTFS_COMPACT_MODEL = TEST_COMPACT_MODEL;
+  }
+  if (!String(process.env.CONTEXTFS_EMBEDDING_API_KEY || "").trim()) {
+    process.env.CONTEXTFS_EMBEDDING_API_KEY = "test-key";
+  }
+  if (!String(process.env.CONTEXTFS_EMBEDDING_BASE_URL || "").trim()) {
+    process.env.CONTEXTFS_EMBEDDING_BASE_URL = "https://api.siliconflow.cn/v1";
+  }
+  try {
+    const results = [await test1(), await test2(), await test3(), await test4(), await test5(), await test6(), await test7(), await test8()];
+    printTable(results);
+    console.log("\n# JSON Summary\n");
+    console.log(JSON.stringify({ allPass: results.every((x) => x.pass), results }, null, 2));
+    process.exitCode = results.every((x) => x.pass) ? 0 : 1;
+  } finally {
+    restoreFetch();
+    if (previousCompactModel === undefined) {
+      delete process.env.CONTEXTFS_COMPACT_MODEL;
+    } else {
+      process.env.CONTEXTFS_COMPACT_MODEL = previousCompactModel;
+    }
+    if (previousApiKey === undefined) {
+      delete process.env.CONTEXTFS_EMBEDDING_API_KEY;
+    } else {
+      process.env.CONTEXTFS_EMBEDDING_API_KEY = previousApiKey;
+    }
+    if (previousBaseUrl === undefined) {
+      delete process.env.CONTEXTFS_EMBEDDING_BASE_URL;
+    } else {
+      process.env.CONTEXTFS_EMBEDDING_BASE_URL = previousBaseUrl;
+    }
+  }
 }
 
 main().catch((err) => {

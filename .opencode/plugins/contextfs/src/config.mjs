@@ -4,7 +4,7 @@ export const DEFAULT_CONFIG = {
   autoCompact: true,
   contextfsDir: ".contextfs",
   recentTurns: 6,
-  tokenThreshold: 8000,
+  tokenThreshold: 16000,
   pinsMaxItems: 20,
   summaryMaxChars: 3200,
   manifestMaxLines: 20,
@@ -32,6 +32,9 @@ export const DEFAULT_CONFIG = {
   embeddingTimeoutMs: 20000,
   embeddingMaxRetries: 3,
   embeddingBatchSize: 32,
+  compactModel: "Pro/Qwen/Qwen2.5-7B-Instruct",
+  compactTimeoutMs: 20000,
+  compactMaxRetries: 2,
   vectorDim: 64,
   vectorTopN: 20,
   vectorMinSimilarity: 0.35,
@@ -158,6 +161,9 @@ function envConfig() {
   const embeddingTimeoutMs = pickEnv("CONTEXTFS_EMBEDDING_TIMEOUT_MS");
   const embeddingMaxRetries = pickEnv("CONTEXTFS_EMBEDDING_MAX_RETRIES");
   const embeddingBatchSize = pickEnv("CONTEXTFS_EMBEDDING_BATCH_SIZE");
+  const compactModel = pickEnv("CONTEXTFS_COMPACT_MODEL");
+  const compactTimeoutMs = pickEnv("CONTEXTFS_COMPACT_TIMEOUT_MS");
+  const compactMaxRetries = pickEnv("CONTEXTFS_COMPACT_MAX_RETRIES");
   const searchModeDefault = pickEnv("CONTEXTFS_SEARCH_MODE_DEFAULT");
   const indexEnabled = pickEnv("CONTEXTFS_INDEX_ENABLED");
   const indexPath = pickEnv("CONTEXTFS_INDEX_PATH");
@@ -175,6 +181,9 @@ function envConfig() {
   if (embeddingTimeoutMs !== undefined) cfg.embeddingTimeoutMs = embeddingTimeoutMs;
   if (embeddingMaxRetries !== undefined) cfg.embeddingMaxRetries = embeddingMaxRetries;
   if (embeddingBatchSize !== undefined) cfg.embeddingBatchSize = embeddingBatchSize;
+  if (compactModel !== undefined) cfg.compactModel = compactModel;
+  if (compactTimeoutMs !== undefined) cfg.compactTimeoutMs = compactTimeoutMs;
+  if (compactMaxRetries !== undefined) cfg.compactMaxRetries = compactMaxRetries;
   if (searchModeDefault !== undefined) cfg.searchModeDefault = searchModeDefault;
   if (indexEnabled !== undefined) cfg.indexEnabled = indexEnabled;
   if (indexPath !== undefined) cfg.indexPath = indexPath;
@@ -235,6 +244,9 @@ export function mergeConfig(userConfig = {}) {
     embeddingTimeoutMs: clampInt(merged.embeddingTimeoutMs, DEFAULT_CONFIG.embeddingTimeoutMs, 1000, 120000),
     embeddingMaxRetries: clampInt(merged.embeddingMaxRetries, DEFAULT_CONFIG.embeddingMaxRetries, 0, 10),
     embeddingBatchSize: clampInt(merged.embeddingBatchSize, DEFAULT_CONFIG.embeddingBatchSize, 1, 256),
+    compactModel: toText(merged.compactModel, DEFAULT_CONFIG.compactModel),
+    compactTimeoutMs: clampInt(merged.compactTimeoutMs, DEFAULT_CONFIG.compactTimeoutMs, 1000, 120000),
+    compactMaxRetries: clampInt(merged.compactMaxRetries, DEFAULT_CONFIG.compactMaxRetries, 0, 10),
     vectorDim: clampInt(merged.vectorDim, DEFAULT_CONFIG.vectorDim, 8, 4096),
     vectorTopN: clampInt(merged.vectorTopN, DEFAULT_CONFIG.vectorTopN, 1, 200),
     vectorMinSimilarity: clampFloat(merged.vectorMinSimilarity, DEFAULT_CONFIG.vectorMinSimilarity, -1, 1),

@@ -6,7 +6,6 @@ import path from "node:path";
 
 import { estimateTokens } from "../src/token.mjs";
 import { dedupePins } from "../src/pins.mjs";
-import { mergeSummary } from "../src/summary.mjs";
 import { buildContextPack } from "../src/packer.mjs";
 import { maybeCompact } from "../src/compactor.mjs";
 import { mergeConfig } from "../src/config.mjs";
@@ -45,22 +44,6 @@ test("dedupePins removes exact and prefix-like duplicates", () => {
   assert.ok(out.some((x) => x.text.includes("vector database")));
 });
 
-test("mergeSummary appends incrementally and stays bounded", () => {
-  const oldSummary = "# Rolling Summary\n\n- [USER] first decision\n";
-  const merged = mergeSummary(
-    oldSummary,
-    [
-      "[USER] must keep plugin small",
-      "[ASSISTANT] implemented compaction",
-      "[USER] must keep plugin small",
-    ],
-    120,
-  );
-  assert.ok(merged.startsWith("# Rolling Summary"));
-  assert.ok(merged.length <= 130);
-  assert.ok(merged.includes("implemented compaction") || merged.includes("keep plugin small"));
-});
-
 test("mergeConfig clamps invalid values and normalizes booleans", () => {
   const cfg = mergeConfig({
     recentTurns: -5,
@@ -81,11 +64,14 @@ test("mergeConfig clamps invalid values and normalizes booleans", () => {
     fusionRrfK: 9999,
     fusionCandidateMax: 0,
     embeddingTextMaxChars: 16,
+    compactModel: "",
+    compactTimeoutMs: 10,
+    compactMaxRetries: 99,
     packDelimiterStart: "XXX",
     packDelimiterEnd: "XXX",
   });
   assert.equal(cfg.recentTurns, 1);
-  assert.equal(cfg.tokenThreshold, 8000);
+  assert.equal(cfg.tokenThreshold, 16000);
   assert.equal(cfg.pinsMaxItems, 1);
   assert.equal(cfg.summaryMaxChars, 256);
   assert.equal(cfg.manifestMaxLines, 8);
@@ -102,6 +88,9 @@ test("mergeConfig clamps invalid values and normalizes booleans", () => {
   assert.equal(cfg.fusionRrfK, 500);
   assert.equal(cfg.fusionCandidateMax, 1);
   assert.equal(cfg.embeddingTextMaxChars, 128);
+  assert.equal(cfg.compactModel, "Pro/Qwen/Qwen2.5-7B-Instruct");
+  assert.equal(cfg.compactTimeoutMs, 1000);
+  assert.equal(cfg.compactMaxRetries, 10);
   assert.notEqual(cfg.packDelimiterStart, cfg.packDelimiterEnd);
   const huge = mergeConfig({ packDelimiterStart: "S".repeat(400), packDelimiterEnd: "E".repeat(400) });
   assert.ok(huge.packDelimiterStart.length <= 128);
@@ -116,6 +105,7 @@ test("loadContextFsEnv reads .env style file and preserves existing vars", async
     "CONTEXTFS_EMBEDDING_MODEL=Pro/BAAI/bge-m3",
     "CONTEXTFS_EMBEDDING_BASE_URL=https://api.siliconflow.cn/v1",
     "CONTEXTFS_EMBEDDING_API_KEY=from_env_file",
+    "CONTEXTFS_COMPACT_MODEL=Pro/Qwen/Qwen2.5-7B-Instruct",
   ].join("\n"), "utf8");
   const prevApiKey = process.env.CONTEXTFS_EMBEDDING_API_KEY;
   try {
@@ -125,6 +115,7 @@ test("loadContextFsEnv reads .env style file and preserves existing vars", async
     assert.equal(process.env.CONTEXTFS_EMBEDDING_PROVIDER, "siliconflow");
     assert.equal(process.env.CONTEXTFS_EMBEDDING_MODEL, "Pro/BAAI/bge-m3");
     assert.equal(process.env.CONTEXTFS_EMBEDDING_API_KEY, "already_set");
+    assert.equal(process.env.CONTEXTFS_COMPACT_MODEL, "Pro/Qwen/Qwen2.5-7B-Instruct");
   } finally {
     if (prevApiKey === undefined) {
       delete process.env.CONTEXTFS_EMBEDDING_API_KEY;
@@ -134,6 +125,7 @@ test("loadContextFsEnv reads .env style file and preserves existing vars", async
     delete process.env.CONTEXTFS_EMBEDDING_PROVIDER;
     delete process.env.CONTEXTFS_EMBEDDING_MODEL;
     delete process.env.CONTEXTFS_EMBEDDING_BASE_URL;
+    delete process.env.CONTEXTFS_COMPACT_MODEL;
     await fs.rm(tmpDir, { recursive: true, force: true });
   }
 });
@@ -226,12 +218,55 @@ test("CONTEXT_LAYERS.md documents stable L0/L1/L2 contracts", async () => {
 
 async function withTempStorage(run) {
   const workspaceDir = await fs.mkdtemp(path.join(os.tmpdir(), "contextfs-test-"));
-  const config = mergeConfig({ contextfsDir: ".contextfs" });
+  const config = mergeConfig({
+    contextfsDir: ".contextfs",
+    embeddingApiKey: "test-key",
+    compactModel: "Pro/Qwen/Qwen2.5-7B-Instruct",
+    compactTimeoutMs: 2000,
+    compactMaxRetries: 0,
+  });
   const storage = new ContextFsStorage(workspaceDir, config);
+  const previousFetch = globalThis.fetch;
+  globalThis.fetch = async (url, init) => {
+    const target = String(url || "");
+    if (target.endsWith("/chat/completions")) {
+      let prompt = "";
+      try {
+        const parsed = JSON.parse(String(init?.body || "{}"));
+        prompt = String(parsed?.messages?.[1]?.content || "");
+      } catch {
+        prompt = "";
+      }
+      const compactLine = prompt
+        .split("\n")
+        .find((line) => line.includes("[USER]") || line.includes("[ASSISTANT]") || line.includes("[SYSTEM]"));
+      const detail = compactLine ? compactLine.replace(/^\d+\.\s*/, "").trim() : "compacted by model";
+      return {
+        ok: true,
+        status: 200,
+        async json() {
+          return {
+            choices: [
+              {
+                message: {
+                  content: `# Rolling Summary\n\n- compacted by external model\n- ${detail}\n`,
+                },
+              },
+            ],
+          };
+        },
+      };
+    }
+    if (typeof previousFetch === "function") {
+      return previousFetch(url, init);
+    }
+    throw new Error(`unexpected fetch in test: ${target || "<empty>"}`);
+  };
   await storage.ensureInitialized();
   try {
     await run({ storage, config, workspaceDir });
   } finally {
+    globalThis.fetch = previousFetch;
     await fs.rm(workspaceDir, { recursive: true, force: true });
   }
 }
@@ -803,6 +838,54 @@ test("maybeCompact does not lose concurrent append", async () => {
 
     const history = await storage.readHistory();
     assert.ok(history.some((item) => item.text === "NEW-APPEND"));
+  });
+});
+
+test("maybeCompact throws when external compact summary request fails", async () => {
+  await withTempStorage(async ({ storage, config }) => {
+    const localConfig = { ...config, recentTurns: 1, tokenThreshold: 1, autoCompact: true };
+    await storage.writeText("summary", "# Rolling Summary\n\n- keep-original-summary\n");
+    for (let i = 1; i <= 3; i += 1) {
+      await storage.appendHistory({
+        role: i % 2 ? "user" : "assistant",
+        text: `failure-case-${i}`,
+        ts: new Date().toISOString(),
+      });
+    }
+
+    const previousFetch = globalThis.fetch;
+    globalThis.fetch = async (url, init) => {
+      const target = String(url || "");
+      if (target.endsWith("/chat/completions")) {
+        return {
+          ok: false,
+          status: 500,
+          async text() {
+            return "compact endpoint down";
+          },
+        };
+      }
+      if (typeof previousFetch === "function") {
+        return previousFetch(url, init);
+      }
+      throw new Error(`unexpected fetch in test: ${target || "<empty>"}`);
+    };
+
+    try {
+      await assert.rejects(
+        maybeCompact(storage, localConfig, true),
+        /compact summary generation failed/i,
+      );
+    } finally {
+      globalThis.fetch = previousFetch;
+    }
+
+    const summary = await storage.readText("summary");
+    const archive = await storage.readHistoryArchive();
+    const history = await storage.readHistory();
+    assert.ok(summary.includes("keep-original-summary"));
+    assert.equal(archive.length, 0);
+    assert.equal(history.length, 3);
   });
 });
 
