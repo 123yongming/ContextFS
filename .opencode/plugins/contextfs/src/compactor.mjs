@@ -1,41 +1,28 @@
 import { estimateTokens, estimateBlockTokens } from "./token.mjs";
-
-const DEFAULT_COMPACT_MODEL = "Pro/Qwen/Qwen2.5-7B-Instruct";
-const DEFAULT_BASE_URL = "https://api.siliconflow.cn/v1";
-
-function clampInt(value, fallback, min, max) {
-  const n = Number(value);
-  if (!Number.isFinite(n)) {
-    return fallback;
-  }
-  return Math.min(max, Math.max(min, Math.floor(n)));
-}
-
-function safeTrim(value) {
-  return String(value || "").trim();
-}
-
-function normalizeBaseUrl(value, fallback = DEFAULT_BASE_URL) {
-  const base = safeTrim(value) || fallback;
-  return base.replace(/\/+$/, "");
-}
-
-function sleepMs(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-function isRetryableStatus(code) {
-  return code === 408 || code === 409 || code === 425 || code === 429 || (code >= 500 && code <= 599);
-}
-
-function isRetryableFetchError(err) {
-  const name = String(err?.name || "").toLowerCase();
-  const code = String(err?.code || "").toUpperCase();
-  if (name === "aborterror") {
-    return true;
-  }
-  return code === "ECONNRESET" || code === "ECONNREFUSED" || code === "ETIMEDOUT" || code === "EAI_AGAIN";
-}
+import {
+  safeTrim,
+  clampInt,
+  sleepMs,
+  normalizeBaseUrl,
+  isRetryableStatus,
+  isRetryableFetchError,
+} from "./utils.mjs";
+import {
+  DEFAULT_COMPACT_MODEL,
+  DEFAULT_EMBEDDING_BASE_URL as DEFAULT_BASE_URL,
+  COMPACT_TIMEOUT_MS_DEFAULT,
+  TIMEOUT_MIN_MS,
+  TIMEOUT_MAX_MS,
+  RETRY_MAX_ATTEMPTS,
+  RETRY_BASE_DELAY_MS,
+  RETRY_MAX_DELAY_MS,
+  SUMMARY_MAX_CHARS_DEFAULT,
+  SUMMARY_MIN_CHARS,
+  SUMMARY_MAX_CHARS_LIMIT,
+  RECENT_TURNS_DEFAULT,
+  RECENT_TURNS_MIN,
+  PROMPT_TURN_MAX_CHARS,
+} from "./constants.mjs";
 
 function sanitizeSummaryContent(text) {
   const source = String(text || "").trim();
@@ -49,7 +36,7 @@ function sanitizeSummaryContent(text) {
 function formatPromptTurn(turn, index) {
   const role = safeTrim(turn?.role || "unknown").toUpperCase() || "UNKNOWN";
   const text = String(turn?.text || "").replace(/\s+/g, " ").trim();
-  const body = text.length <= 1200 ? text : `${text.slice(0, 1197)}...`;
+  const body = text.length <= PROMPT_TURN_MAX_CHARS ? text : `${text.slice(0, PROMPT_TURN_MAX_CHARS - 3)}...`;
   return `${index + 1}. [${role}] ${body}`;
 }
 
@@ -101,7 +88,7 @@ function extractCompletionText(payload) {
 }
 
 function normalizeSummaryFromModel(rawSummary, maxChars) {
-  const safeMax = clampInt(maxChars, 3200, 256, 20000);
+  const safeMax = clampInt(maxChars, SUMMARY_MAX_CHARS_DEFAULT, SUMMARY_MIN_CHARS, SUMMARY_MAX_CHARS_LIMIT);
   const clean = sanitizeSummaryContent(rawSummary);
   if (!clean) {
     throw new Error("model returned empty summary");
@@ -193,7 +180,7 @@ async function fetchCompactSummaryWithRetry({
       if (!res.ok) {
         const text = safeTrim(await res.text());
         if (isRetryableStatus(res.status) && attempt < maxRetries) {
-          await sleepMs(Math.min(3000, 250 * (2 ** attempt)));
+          await sleepMs(Math.min(RETRY_MAX_DELAY_MS, RETRY_BASE_DELAY_MS * (2 ** attempt)));
           attempt += 1;
           continue;
         }
@@ -203,7 +190,7 @@ async function fetchCompactSummaryWithRetry({
     } catch (err) {
       clearTimeout(timer);
       if (attempt < maxRetries && isRetryableFetchError(err)) {
-        await sleepMs(Math.min(3000, 250 * (2 ** attempt)));
+        await sleepMs(Math.min(RETRY_MAX_DELAY_MS, RETRY_BASE_DELAY_MS * (2 ** attempt)));
         attempt += 1;
         continue;
       }
@@ -220,8 +207,8 @@ async function buildCompactSummaryWithModel(existingSummary, oldTurns, config) {
   const model = safeTrim(config?.compactModel || process.env.CONTEXTFS_COMPACT_MODEL || DEFAULT_COMPACT_MODEL);
   const baseUrl = normalizeBaseUrl(config?.embeddingBaseUrl || process.env.CONTEXTFS_EMBEDDING_BASE_URL, DEFAULT_BASE_URL);
   const apiKey = safeTrim(config?.embeddingApiKey || process.env.CONTEXTFS_EMBEDDING_API_KEY);
-  const timeoutMs = clampInt(config?.compactTimeoutMs, 20000, 1000, 120000);
-  const maxRetries = clampInt(config?.compactMaxRetries, 2, 0, 10);
+  const timeoutMs = clampInt(config?.compactTimeoutMs, COMPACT_TIMEOUT_MS_DEFAULT, TIMEOUT_MIN_MS, TIMEOUT_MAX_MS);
+  const maxRetries = clampInt(config?.compactMaxRetries, RETRY_MAX_ATTEMPTS - 1, 0, RETRY_MAX_ATTEMPTS + 7);
 
   if (!apiKey) {
     throw new Error("compact summary api key is missing (CONTEXTFS_EMBEDDING_API_KEY)");
@@ -273,7 +260,7 @@ export async function maybeCompact(storage, config, force = false) {
       };
     }
 
-    const keep = Math.max(1, Number(config.recentTurns || 6));
+    const keep = Math.max(RECENT_TURNS_MIN, Number(config.recentTurns || RECENT_TURNS_DEFAULT));
     const splitIndex = Math.max(0, history.length - keep);
     const oldTurns = history.slice(0, splitIndex);
     const recentTurns = history.slice(splitIndex);

@@ -14,6 +14,39 @@ import {
   sqliteIndexDoctor,
 } from "./index/sqlite_store.mjs";
 import { estimateTokens } from "./token.mjs";
+import {
+  safeTrim,
+  toInt,
+  clampIntSimple as clampInt,
+  uniqList,
+  isValidTs,
+} from "./utils.mjs";
+import {
+  SEARCH_DEFAULT_K,
+  SEARCH_MAX_K,
+  SEARCH_MIN_K,
+  TRACES_TAIL_DEFAULT,
+  TRACES_TAIL_MAX,
+  TRACES_MAX_FILES,
+  CAT_HEAD_DEFAULT,
+  GET_HEAD_DEFAULT,
+  GET_HEAD_MAX,
+  TIMELINE_BEFORE_DEFAULT,
+  TIMELINE_AFTER_DEFAULT,
+  TIMELINE_WINDOW_MAX,
+  VECTOR_TOP_N_DEFAULT,
+  VECTOR_TOP_N_MAX,
+  VECTOR_TOP_N_MIN,
+  VECTOR_MIN_SIMILARITY_DEFAULT,
+  ANN_PROBE_TOP_N_MAX,
+  FUSION_RRF_K_DEFAULT,
+  FUSION_CANDIDATE_MAX,
+  MAX_SESSION_ID_LENGTH,
+  SEARCH_SUMMARY_MAX_CHARS_DEFAULT,
+  TRACE_ERROR_MAX_CHARS,
+  SIZE_SMALL_THRESHOLD,
+  SIZE_MEDIUM_THRESHOLD,
+} from "./constants.mjs";
 
 function parseArgs(raw) {
   const input = String(raw || "").trim();
@@ -24,15 +57,6 @@ function parseArgs(raw) {
     parts.push(m[1] ?? m[2] ?? m[3]);
   }
   return parts;
-}
-
-function toInt(value, fallback) {
-  const n = Number(value);
-  return Number.isFinite(n) ? n : fallback;
-}
-
-function clampInt(value, min, max) {
-  return Math.max(min, Math.min(max, Math.floor(Number(value) || 0)));
 }
 
 function hasFlag(args, flag) {
@@ -48,7 +72,7 @@ function getFlagValue(args, flag, fallback) {
 }
 
 function isMissingFlagValue(value) {
-  const text = String(value ?? "").trim();
+  const text = safeTrim(value);
   return !text || text.startsWith("--");
 }
 
@@ -155,7 +179,7 @@ function normalizeSaveType(input) {
 }
 
 function lineSummary(text, maxChars) {
-  const oneLine = String(text || "").replace(/\s+/g, " ").trim();
+  const oneLine = safeTrim(text).replace(/\s+/g, " ");
   if (oneLine.length <= maxChars) {
     return oneLine;
   }
@@ -163,7 +187,7 @@ function lineSummary(text, maxChars) {
 }
 
 function safeOneLine(text, maxChars, truncatedFields, fieldName) {
-  const oneLine = String(text || "").replace(/\s+/g, " ").trim();
+  const oneLine = safeTrim(text).replace(/\s+/g, " ");
   if (oneLine.length <= maxChars) {
     return oneLine;
   }
@@ -188,8 +212,8 @@ function sessionLabel(session) {
 function sizeBucket(tokens) {
   const n = Number(tokens);
   const safe = Number.isFinite(n) ? n : 0;
-  if (safe <= 220) return "small";
-  if (safe <= 520) return "medium";
+  if (safe <= SIZE_SMALL_THRESHOLD) return "small";
+  if (safe <= SIZE_MEDIUM_THRESHOLD) return "medium";
   return "large";
 }
 
@@ -210,7 +234,7 @@ function toL0Row(entry, config, source, extras = {}) {
 }
 
 function tokenize(text) {
-  const input = String(text || "").toLowerCase();
+  const input = safeTrim(text).toLowerCase();
   const tokens = new Set(
     input
       .split(/[^a-z0-9_\-]+/)
@@ -273,11 +297,10 @@ function scoreEntry(entry, queryTokens, newestTs) {
 }
 
 function isoMaybe(text) {
-  const ts = Date.parse(String(text || ""));
-  if (!Number.isFinite(ts)) {
+  if (!isValidTs(text)) {
     return "n/a";
   }
-  return new Date(ts).toISOString();
+  return new Date(Date.parse(safeTrim(text))).toISOString();
 }
 
 function jsonOrText(payload, asJson) {
@@ -886,7 +909,7 @@ export async function runCtxCommandArgs(rawArgv, storage, config) {
       return errorResult("unknown file. use manifest|pins|summary|history");
     }
     const headIndex = args.indexOf("--head");
-    const head = headIndex >= 0 ? toInt(args[headIndex + 1], 30) : null;
+    const head = headIndex >= 0 ? toInt(args[headIndex + 1], CAT_HEAD_DEFAULT) : null;
     const text = await storage.readText(target);
     const lines = text.split("\n");
     const out = head ? lines.slice(0, head).join("\n") : text;
@@ -895,7 +918,7 @@ export async function runCtxCommandArgs(rawArgv, storage, config) {
 
   if (cmd === "traces") {
     const asJson = hasFlag(args, "--json");
-    const tail = clampInt(toInt(getFlagValue(args, "--tail", config.tracesTailDefault), config.tracesTailDefault), 1, 200);
+    const tail = clampInt(toInt(getFlagValue(args, "--tail", config.tracesTailDefault), config.tracesTailDefault), 1, TRACES_TAIL_MAX);
     const traces = await storage.readRetrievalTraces({ tail, config });
 
     if (asJson) {
@@ -1043,7 +1066,7 @@ export async function runCtxCommandArgs(rawArgv, storage, config) {
     const startedAt = Date.now();
     const traceTs = new Date().toISOString();
     const asJson = hasFlag(args, "--json");
-    const k = clampInt(toInt(getFlagValue(args, "--k", config.searchDefaultK), config.searchDefaultK), 1, 50);
+    const k = clampInt(toInt(getFlagValue(args, "--k", config.searchDefaultK), config.searchDefaultK), SEARCH_MIN_K, SEARCH_MAX_K);
     const scope = String(getFlagValue(args, "--scope", "all") || "all").toLowerCase();
     const requestedMode = normalizeSearchMode(
       getFlagValue(args, "--mode", config.searchModeDefault || "fallback"),
@@ -1079,7 +1102,7 @@ export async function runCtxCommandArgs(rawArgv, storage, config) {
         budgets: traceBudgets,
         state_revision: state.revision || 0,
         duration_ms: Date.now() - startedAt,
-        error: safeOneLine(message, 400),
+        error: safeOneLine(message, TRACE_ERROR_MAX_CHARS),
       }, { config });
     };
 
@@ -1108,9 +1131,9 @@ export async function runCtxCommandArgs(rawArgv, storage, config) {
         : pool.filter((item) => String(item?.session_id || "") === String(session.sessionId || ""));
     const newestTs = sessionPool.length ? Date.parse(String(sessionPool[sessionPool.length - 1].ts || "")) : Date.now();
     const candidateMax = clampInt(
-      toInt(config.fusionCandidateMax, Math.max(k, config.vectorTopN || 20)),
+      toInt(config.fusionCandidateMax, Math.max(k, config.vectorTopN || VECTOR_TOP_N_DEFAULT)),
       k,
-      500,
+      FUSION_CANDIDATE_MAX,
     );
     const latency = {
       lexical: 0,
@@ -1142,10 +1165,10 @@ export async function runCtxCommandArgs(rawArgv, storage, config) {
             .filter((item) => item.score > 0)
             .slice(0, candidateMax);
         } else {
-          lexicalFallbackReason = safeOneLine(String(sqliteResult?.reason || "sqlite lexical unavailable"), 220);
+          lexicalFallbackReason = safeOneLine(String(sqliteResult?.reason || "sqlite lexical unavailable"), TRACE_ERROR_MAX_CHARS);
         }
       } catch (err) {
-        lexicalFallbackReason = safeOneLine(String(err?.message || err), 220);
+        lexicalFallbackReason = safeOneLine(String(err?.message || err), TRACE_ERROR_MAX_CHARS);
       }
     }
     if (requestedMode === "legacy" || (!lexicalRanked.length && lexicalEngineUsed !== "sqlite_fts5")) {
@@ -1197,7 +1220,7 @@ export async function runCtxCommandArgs(rawArgv, storage, config) {
           throw new Error("query embedding is empty");
         }
         await ensureVectorRows(storage, provider, sessionPool, hotIds, providerConfig);
-        const vectorLimit = clampInt(toInt(config.vectorTopN, 20), 1, 200);
+        const vectorLimit = clampInt(toInt(config.vectorTopN, VECTOR_TOP_N_DEFAULT), VECTOR_TOP_N_MIN, VECTOR_TOP_N_MAX);
         const vectorCandidateK = Math.max(k, vectorLimit, candidateMax);
         const sessionId = session.mode === "all" ? "" : String(session.sessionId || "");
         const annEnabled = providerConfig.annEnabled !== false;
@@ -1210,7 +1233,7 @@ export async function runCtxCommandArgs(rawArgv, storage, config) {
               k: vectorCandidateK,
               scope,
               sessionId,
-              annTopN: Math.max(vectorCandidateK, clampInt(toInt(config.annTopN, vectorCandidateK), vectorCandidateK, 5000)),
+              annTopN: Math.max(vectorCandidateK, clampInt(toInt(config.annTopN, vectorCandidateK), vectorCandidateK, ANN_PROBE_TOP_N_MAX)),
               embeddingVersion: String(queryEmbedding?.embedding_version || ""),
             },
           )
@@ -1230,7 +1253,7 @@ export async function runCtxCommandArgs(rawArgv, storage, config) {
               k: vectorCandidateK,
               scope,
               sessionId,
-              minSimilarity: Number(config.vectorMinSimilarity ?? 0.35),
+              minSimilarity: Number(config.vectorMinSimilarity ?? VECTOR_MIN_SIMILARITY_DEFAULT),
               linearLimit: Math.max(
                 vectorCandidateK,
                 clampInt(toInt(config.annProbeTopN, vectorCandidateK), vectorCandidateK, 100000),
@@ -1248,17 +1271,17 @@ export async function runCtxCommandArgs(rawArgv, storage, config) {
           vectorRows = Array.isArray(linearResult.rows) ? linearResult.rows : [];
           if (!vectorRows.length) {
             const annReason = String(annResult?.reason || "ann_no_hits");
-            const linearReason = String(linearResult?.reason || "linear_no_hits");
-            vectorFallbackReason = safeOneLine(`${annReason}; ${linearReason}`, 220);
+          const linearReason = String(linearResult?.reason || "linear_no_hits");
+          vectorFallbackReason = safeOneLine(`${annReason}; ${linearReason}`, TRACE_ERROR_MAX_CHARS);
           }
         } else {
           retrievalModeUsed = "lexical";
           const annReason = String(annResult?.reason || "ann_unavailable");
           const linearReason = String(linearResult?.reason || "linear_unavailable");
-          vectorFallbackReason = safeOneLine(`${annReason}; ${linearReason}`, 220);
+          vectorFallbackReason = safeOneLine(`${annReason}; ${linearReason}`, TRACE_ERROR_MAX_CHARS);
         }
         if (vectorRows.length && vectorEngineUsed === "sqlite_vec_ann") {
-          const probeN = clampInt(toInt(config.annProbeTopN, 0), 0, 5000);
+          const probeN = clampInt(toInt(config.annProbeTopN, 0), 0, ANN_PROBE_TOP_N_MAX);
           if (probeN > 0 && Math.random() < 0.1) {
             const probeLinear = await searchSqliteVectorLinear(
               storage.workspaceDir,
@@ -1309,7 +1332,7 @@ export async function runCtxCommandArgs(rawArgv, storage, config) {
         }
       } catch (err) {
         retrievalModeUsed = "lexical";
-        vectorFallbackReason = safeOneLine(String(err?.message || err), 220);
+        vectorFallbackReason = safeOneLine(String(err?.message || err), TRACE_ERROR_MAX_CHARS);
       }
     }
     latency.vector = Date.now() - vectorStartedAt;
@@ -1325,7 +1348,7 @@ export async function runCtxCommandArgs(rawArgv, storage, config) {
     const fusedRanked = [];
     const fusionStartedAt = Date.now();
     if (retrievalModeUsed === "hybrid" && vectorRankById.size > 0) {
-      const rrfK = clampInt(toInt(config.fusionRrfK, 60), 1, 500);
+      const rrfK = clampInt(toInt(config.fusionRrfK, FUSION_RRF_K_DEFAULT), 1, FUSION_CANDIDATE_MAX);
       const merged = new Map();
       for (const [id, lexical] of lexicalRankById) {
         merged.set(id, {
@@ -1538,12 +1561,12 @@ export async function runCtxCommandArgs(rawArgv, storage, config) {
     const before = clampInt(
       toInt(getFlagValue(args, "--before", config.timelineBeforeDefault), config.timelineBeforeDefault),
       0,
-      20,
+      TIMELINE_WINDOW_MAX,
     );
     const after = clampInt(
       toInt(getFlagValue(args, "--after", config.timelineAfterDefault), config.timelineAfterDefault),
       0,
-      20,
+      TIMELINE_WINDOW_MAX,
     );
 
     const traceArgs = {
@@ -1573,7 +1596,7 @@ export async function runCtxCommandArgs(rawArgv, storage, config) {
         budgets: traceBudgets,
         state_revision: state.revision || 0,
         duration_ms: Date.now() - startedAt,
-        error: safeOneLine(message, 400),
+        error: safeOneLine(message, TRACE_ERROR_MAX_CHARS),
       }, { config });
     };
 
@@ -1676,7 +1699,7 @@ export async function runCtxCommandArgs(rawArgv, storage, config) {
     const traceTs = new Date().toISOString();
     const asJson = hasFlag(args, "--json");
     const session = await getSessionFilter(args, storage, "ctx get <id> [--head 1200] [--session all|current|<id>]");
-    const headRequested = clampInt(toInt(getFlagValue(args, "--head", config.getDefaultHead), config.getDefaultHead), 0, 200000);
+    const headRequested = clampInt(toInt(getFlagValue(args, "--head", config.getDefaultHead), config.getDefaultHead), 0, GET_HEAD_MAX);
 
     const writeTraceError = async (idValue, message) => {
       const state = await storage.readState();

@@ -9,88 +9,35 @@ import {
   upsertSqliteTurnRows,
   upsertSqliteVectorRows,
 } from "./index/sqlite_store.mjs";
-
-const FILES = {
-  manifest: "manifest.md",
-  pins: "pins.md",
-  summary: "summary.md",
-  history: "history.ndjson",
-  historyArchive: "history.archive.ndjson",
-  historyEmbeddingHot: "history.embedding.hot.ndjson",
-  historyEmbeddingArchive: "history.embedding.archive.ndjson",
-  historyBad: "history.bad.ndjson",
-  retrievalTraces: "retrieval.traces.ndjson",
-  state: "state.json",
-};
-
-const LEGACY_FALLBACK_EPOCH_MS = 0;
-const RETRYABLE_LOCK_ERRORS = new Set(["EEXIST", "EBUSY"]);
-const LOCK_PERMISSION_ERRORS = new Set(["EPERM", "EACCES"]);
-const RETRYABLE_RENAME_ERRORS = new Set(["EBUSY", "EPERM", "EXDEV"]);
-const RETRYABLE_UNLINK_ERRORS = new Set(["EBUSY", "EPERM"]);
-
-function nowIso() {
-  return new Date().toISOString();
-}
-
-function safeTrim(text) {
-  return String(text || "").trim();
-}
-
-function stableFallbackTs(index) {
-  const n = Number(index);
-  const safeIndex = Number.isFinite(n) && n >= 0 ? Math.floor(n) : 0;
-  return new Date(LEGACY_FALLBACK_EPOCH_MS + safeIndex).toISOString();
-}
-
-function isValidTs(value) {
-  const text = safeTrim(value);
-  if (!text) {
-    return false;
-  }
-  return Number.isFinite(Date.parse(text));
-}
-
-function shortHash(text) {
-  const source = String(text || "");
-  let h = 2166136261;
-  for (let i = 0; i < source.length; i += 1) {
-    h ^= source.charCodeAt(i);
-    h += (h << 1) + (h << 4) + (h << 7) + (h << 8) + (h << 24);
-  }
-  return (h >>> 0).toString(16).slice(0, 10);
-}
-
-function uniqList(items, max = 12) {
-  const out = [];
-  const seen = new Set();
-  for (const item of items) {
-    const value = safeTrim(item);
-    if (!value || seen.has(value)) {
-      continue;
-    }
-    seen.add(value);
-    out.push(value);
-    if (out.length >= max) {
-      break;
-    }
-  }
-  return out;
-}
-
-function normalizeTs(value, fallbackTs) {
-  const text = safeTrim(value);
-  if (text) {
-    const t = Date.parse(text);
-    if (!Number.isNaN(t)) {
-      return new Date(t).toISOString();
-    }
-  }
-  if (isValidTs(fallbackTs)) {
-    return new Date(Date.parse(fallbackTs)).toISOString();
-  }
-  return stableFallbackTs(0);
-}
+import {
+  safeTrim,
+  nowIso,
+  stableFallbackTs,
+  isValidTs,
+  shortHash,
+  uniqList,
+  normalizeTs,
+  sleepMs,
+  isRetryableSqliteWriteError,
+  makeTmpPath,
+} from "./utils.mjs";
+import {
+  FILES,
+  RETRYABLE_LOCK_ERRORS,
+  LOCK_PERMISSION_ERRORS,
+  RETRYABLE_RENAME_ERRORS,
+  RETRYABLE_UNLINK_ERRORS,
+  RETRY_MAX_ATTEMPTS,
+  LOCK_MAX_RETRIES,
+  LOCK_STALE_MS_DEFAULT,
+  LOCK_STALE_MS_MIN,
+  MAX_SESSION_ID_LENGTH,
+  TRACES_MAX_FILES,
+  TRACES_MIN_FILES,
+  TRACES_TAIL_MAX,
+  TRACES_TAIL_DEFAULT,
+  SCHEMA_VERSION,
+} from "./constants.mjs";
 
 function normalizeRole(value) {
   const role = safeTrim(value).toLowerCase();
@@ -154,8 +101,7 @@ function normalizeSessionId(value) {
     return undefined;
   }
   // Keep session ids small/stable; avoid bloating history/index rows.
-  const maxLen = 96;
-  return clean.length <= maxLen ? clean : clean.slice(0, maxLen);
+  return clean.length <= MAX_SESSION_ID_LENGTH ? clean : clean.slice(0, MAX_SESSION_ID_LENGTH);
 }
 
 function normalizeEntry(raw, fallbackTs = stableFallbackTs(0)) {
@@ -202,19 +148,7 @@ function makeUniqueId(baseId, usedIds) {
   return candidate;
 }
 
-function sleepMs(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
 
-function isRetryableSqliteWriteError(err) {
-  const msg = String(err?.message || "").toUpperCase();
-  return msg.includes("SQLITE_BUSY") || msg.includes("SQLITE_LOCKED");
-}
-
-function makeTmpPath(target) {
-  const rand = Math.random().toString(16).slice(2, 10);
-  return `${target}.${process.pid}.${Date.now()}.${rand}.tmp`;
-}
 
 async function renameWithRetry(fromPath, toPath, maxRetries = 6) {
   for (let i = 0; i <= maxRetries; i += 1) {
@@ -525,7 +459,7 @@ export class ContextFsStorage {
       }
 
       const warm = await upsertSqliteTurnRows(this.workspaceDir, this.config, [], {
-        schema_version: "1",
+        schema_version: SCHEMA_VERSION,
         updated_at: nowIso(),
       });
       if (!warm?.available) {
@@ -671,11 +605,10 @@ export class ContextFsStorage {
       if (!rows.length) {
         return { upserted: 0, available: true, reason: "no_valid_rows" };
       }
-      const maxRetries = 3;
-      for (let attempt = 0; attempt <= maxRetries; attempt += 1) {
+      for (let attempt = 0; attempt <= RETRY_MAX_ATTEMPTS; attempt += 1) {
         try {
           const result = await upsertSqliteTurnRows(this.workspaceDir, this.config, rows, {
-            schema_version: "1",
+            schema_version: SCHEMA_VERSION,
             updated_at: nowIso(),
           });
           const payload = {
@@ -686,7 +619,7 @@ export class ContextFsStorage {
           return payload;
         } catch (err) {
           const retryable = isRetryableSqliteWriteError(err);
-          const last = attempt >= maxRetries;
+          const last = attempt >= RETRY_MAX_ATTEMPTS;
           if (!retryable || last) {
             throw err;
           }
@@ -721,8 +654,7 @@ export class ContextFsStorage {
           reason: "no_rows",
         };
       }
-      const maxRetries = 3;
-      for (let attempt = 0; attempt <= maxRetries; attempt += 1) {
+      for (let attempt = 0; attempt <= RETRY_MAX_ATTEMPTS; attempt += 1) {
         try {
           const result = await upsertSqliteVectorRows(this.workspaceDir, this.config, list, meta);
           return {
@@ -734,7 +666,7 @@ export class ContextFsStorage {
           };
         } catch (err) {
           const retryable = isRetryableSqliteWriteError(err);
-          const last = attempt >= maxRetries;
+          const last = attempt >= RETRY_MAX_ATTEMPTS;
           if (!retryable || last) {
             throw err;
           }
@@ -808,8 +740,8 @@ export class ContextFsStorage {
     }
   }
 
-  async acquireLock(maxRetries = 80) {
-    const staleMs = Math.max(1000, Number(this.config.lockStaleMs || 30000));
+  async acquireLock(maxRetries = LOCK_MAX_RETRIES) {
+    const staleMs = Math.max(LOCK_STALE_MS_MIN, Number(this.config.lockStaleMs || LOCK_STALE_MS_DEFAULT));
     for (let i = 0; i <= maxRetries; i += 1) {
       const stamp = `${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2, 8)}`;
       try {
@@ -911,7 +843,7 @@ export class ContextFsStorage {
   async rotateRetrievalTracesIfNeededLocked(cfg, incomingBytes = 0) {
     const config = cfg || this.config;
     const maxBytes = Math.max(1024, Number(config.tracesMaxBytes || 0) || 0);
-    const maxFiles = Math.max(1, Math.min(10, Math.floor(Number(config.tracesMaxFiles || 0) || 0))) || 1;
+    const maxFiles = Math.max(TRACES_MIN_FILES, Math.min(TRACES_MAX_FILES, Math.floor(Number(config.tracesMaxFiles || 0) || 0))) || TRACES_MIN_FILES;
     const mainPath = this.resolve("retrievalTraces");
     const incoming = Math.max(0, Number(incomingBytes) || 0);
     let size = 0;
@@ -993,8 +925,8 @@ export class ContextFsStorage {
   async readRetrievalTraces(options = {}) {
     const config = options.config || this.config;
     const tailRaw = Number(options.tail);
-    const tail = Number.isFinite(tailRaw) ? Math.max(1, Math.min(200, Math.floor(tailRaw))) : Math.max(1, Math.min(200, Number(config.tracesTailDefault || 20) || 20));
-    const maxFiles = Math.max(1, Math.min(10, Math.floor(Number(config.tracesMaxFiles || 0) || 0))) || 1;
+    const tail = Number.isFinite(tailRaw) ? Math.max(1, Math.min(TRACES_TAIL_MAX, Math.floor(tailRaw))) : Math.max(1, Math.min(TRACES_TAIL_MAX, Number(config.tracesTailDefault || TRACES_TAIL_DEFAULT) || TRACES_TAIL_DEFAULT));
+    const maxFiles = Math.max(TRACES_MIN_FILES, Math.min(TRACES_MAX_FILES, Math.floor(Number(config.tracesMaxFiles || 0) || 0))) || TRACES_MIN_FILES;
     const paths = [this.resolve("retrievalTraces")];
     for (let i = 1; i <= maxFiles; i += 1) {
       paths.push(path.join(this.baseDir, `retrieval.traces.${i}.ndjson`));
@@ -1039,7 +971,7 @@ export class ContextFsStorage {
     if (!target) {
       return null;
     }
-    const maxFiles = Math.max(1, Math.min(10, Math.floor(Number(config.tracesMaxFiles || 0) || 0))) || 1;
+    const maxFiles = Math.max(TRACES_MIN_FILES, Math.min(TRACES_MAX_FILES, Math.floor(Number(config.tracesMaxFiles || 0) || 0))) || TRACES_MIN_FILES;
     const paths = [this.resolve("retrievalTraces")];
     for (let i = 1; i <= maxFiles; i += 1) {
       paths.push(path.join(this.baseDir, `retrieval.traces.${i}.ndjson`));
