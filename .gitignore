@@ -4,3 +4,4 @@ docs/
 nul
 .opencode/plugins/contextfs/.env*
 !.opencode/plugins/contextfs/.env.example
+bench/results/

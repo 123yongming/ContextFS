@@ -6,6 +6,9 @@
     "test:contextfs:regression": "node scripts/regression-contextfs.mjs",
     "bench:e2e": "node bench/bench_e2e.mjs",
     "bench:naive": "node bench/bench_naive.mjs",
-    "bench": "node bench/bench.mjs"
+    "bench": "node bench/bench.mjs",
+    "bench:retrieval": "node bench/eval_retrieval.mjs",
+    "bench:task": "node bench/eval_task.mjs",
+    "bench:full": "node bench/eval_all.mjs"
   }
 }

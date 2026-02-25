@@ -1,0 +1,28 @@
+{
+  "generated_at": "2026-02-23T12:22:51.442Z",
+  "params": {
+    "turns": 300,
+    "orders": 1,
+    "avgChars": 280,
+    "variance": 0.5,
+    "seed": 42,
+    "threshold": 1000000,
+    "recentN": null,
+    "outDir": "D:\\code\\python_code\\ContextFS\\bench\\results_full",
+    "judgeEnabled": true,
+    "judgeModel": "",
+    "judgeBaseUrl": ""
+  },
+  "tasks": 150,
+  "task_success_rate": 1,
+  "task_partial_rate": 0,
+  "critical_fact_miss_rate": 0,
+  "judge": {
+    "total_calls": 0,
+    "success_rate": 0,
+    "p95_latency_ms": 0,
+    "failures_by_type": {},
+    "model": "",
+    "base_url": ""
+  }
+}
