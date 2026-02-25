@@ -1,35 +1,69 @@
-# ContextFS
+﻿# ContextFS
 
-ContextFS 是一个给 OpenCode 用的轻量上下文管理插件，目标很简单：
-让长对话不跑偏、可追溯、可检索。
+ContextFS 是一个面向 OpenCode 的轻量上下文工程插件，目标是让 Agent 在长会话中保持“稳定、可检索、可追溯”。
 
-它会把会话沉淀到本地 `.contextfs/`，并在每轮对话自动注入精简且可控的上下文包。
+当前版本：`v5.0.0`
 
-> 当前版本：v4.1.0
+---
 
-## 适合什么场景
+## 1. 为什么需要 ContextFS
 
-- 会话很长，模型开始“忘前文”
-- 需要跨多轮持续执行同一任务
-- 希望关键约束（如代码规范、边界条件）始终生效
-- 想快速回看历史，而不是翻整段聊天记录
+在长链路任务里，常见问题是：
 
-## 你会得到什么
+- 会话越长，token 越容易失控
+- 模型容易“忘前文”，导致任务漂移
+- 需要回溯历史时，只能翻聊天记录，效率低
 
-- 稳定的上下文注入：每轮自动组装 PINS / SUMMARY / MANIFEST / WORKSET
-- 热历史 + 归档历史：近期对话快读，旧对话可检索
-- 严格问答记录：`history.ndjson` 只保留
-  - 原始用户问题
-  - 助手最终回答（不含中间流式过程/工具过程）
-- **SQLite 全文检索**：基于 `better-sqlite3` + FTS5 的高效词法搜索
-- **向量语义检索**：基于 `sqlite-vec` 的向量搜索，支持 ANN 近似最近邻
-- **混合检索模式**：词法 + 语义融合，RRF 排序
-- 渐进式检索流程：`search -> timeline -> get`
-- 自动压缩：对话过长时自动收敛上下文体积（summary 通过外部大模型生成，失败即报错，不做本地降级）
+ContextFS 的核心思路是把上下文管理工程化：
 
-## 快速开始
+- 用固定结构注入上下文（而不是拼接整段历史）
+- 用渐进式检索按需展开细节
+- 用热/归档分层存储，控制成本同时保留可追溯性
 
-### 1) 安装
+---
+
+## 2. 核心能力
+
+### 2.1 稳定上下文注入
+每轮构建固定 Context Pack：
+
+- `PINS`：关键约束（上限 20）
+- `SUMMARY`：压缩摘要（上限 3200 chars）
+- `MANIFEST`：工作区清单（上限 20 行）
+- `RETRIEVAL_INDEX`：最近检索索引
+- `WORKSET_RECENT_TURNS`：最近若干轮导航视图
+
+### 2.2 渐进式检索（L0/L1/L2）
+- `L0`：低成本索引行（search / timeline）
+- `L1`：导航层（PINS/SUMMARY/MANIFEST/WORKSET）
+- `L2`：按需展开完整明细（get）
+
+推荐流程：`search -> timeline -> get`
+
+### 2.3 分层存储与索引
+- `history.ndjson`：热数据
+- `history.archive.ndjson`：归档数据
+- `index.sqlite`：派生检索索引（FTS5 + sqlite-vec）
+
+### 2.4 检索模式
+- `legacy`：grep 兜底
+- `lexical`：SQLite FTS5 词法检索
+- `vector`：sqlite-vec 向量检索
+- `hybrid`：词法+向量融合（RRF）
+- `fallback`：默认自动回退模式
+
+### 2.5 MCP 接入
+提供本地 MCP stdio server，工具契约与 CLI JSON 输出一致：
+
+- `search`
+- `timeline`
+- `get`
+- `save_memory`
+- `__IMPORTANT`
+
+---
+
+## 3. 安装
 
 ```bash
 mkdir -p .opencode/plugins
@@ -39,136 +73,54 @@ cp -r <path-to-contextfs>/.opencode/plugins/contextfs .opencode/plugins/
 
 重启 OpenCode 会话。
 
-### 2) 验证
+---
 
-在 OpenCode 对话框直接输入：
+## 4. 快速开始
+
+在 OpenCode 对话框中：
 
 ```text
 /ctx ls
 /ctx stats
 ```
 
-## 最常用用法（对话框）
+常用命令：
 
 ```text
-/ctx ls                           # 查看状态
-/ctx stats                        # 查看统计
 /ctx search "关键词" --k 5 --mode hybrid --session current
-/ctx search "语义搜索" --mode vector --k 5
-/ctx search "精确匹配" --mode lexical --k 5
-/ctx timeline H-xxx --before 3 --after 3 --session current
-/ctx get H-xxx --head 1200 --session current
-/ctx traces --tail 20
-/ctx trace T-xxxxxxxxxx
-/ctx stats --json
-/ctx doctor --json                # 诊断 SQLite 索引状态
-/ctx pin "不要修改核心架构"
-/ctx save "关键记忆文本" --title "可选标题" --session current
-/ctx compact                     # 手动触发压缩
-/ctx gc                          # 清理重复 ID
-/ctx reindex --full --vectors    # 重建 SQLite 索引
+/ctx timeline H-xxxx --before 3 --after 3 --session current
+/ctx get H-xxxx --head 1200 --session current
+/ctx save "长期记忆" --title "可选标题" --session current
+/ctx doctor --json
+/ctx reindex --full --vectors
 ```
 
-如果只是日常使用，优先使用 `/ctx ...`，不需要手动执行 Node 命令。
+---
 
-## L0/L1/L2 分层（渐进式检索契约）
+## 5. CLI 与 JSON 契约
 
-ContextFS 把“检索与注入”分成三层，核心目的是省 token 且可追溯：
+- `ctx search --json` / `ctx timeline --json`
+  - 返回 `layer: "L0"`
+- `ctx get --json`
+  - 返回 `layer: "L2"`
+- `ctx save --json`
+  - 返回 `layer: "WRITE"`
 
-- L0（Index / Recall）：超便宜的索引行，用来决定“要不要展开、展开哪个 ID”
-  - 对应：`/ctx search`、`/ctx timeline` 输出的摘要行（ID + 摘要）
-- L1（Overview / Navigation）：可预算的概览，用来做决策与保持任务连续性
-  - 对应：PINS / SUMMARY / MANIFEST，以及 pack 里的 `WORKSET_RECENT_TURNS`（导航预览，不是完整回放）
-- L2（Detail / Playback）：按需获取的完整细节
-  - 对应：`/ctx get <id>`
+这套契约用于保证 Agent 工具链可组合、可自动化。
 
-完整契约见：`CONTEXT_LAYERS.md`
+---
 
-## 推荐使用方式
+## 6. MCP Server
 
-1. 先 `/ctx search` 找到相关记录 ID
-2. 用 `/ctx timeline` 判断上下文是否命中
-3. 只在需要细节时再 `/ctx get`
+入口：`.opencode/plugins/contextfs/mcp-server.mjs`
 
-这样可以显著减少 token 浪费，同时保持信息可追溯。
-
-### 输出与字段（当前版本）
-
-- `ctx search` 支持 `--scope all|hot|archive` 控制检索范围；支持 `--session all|current|<session-id>` 做会话隔离（默认 `all`，检索所有会话；用 `current` 仅查当前 OpenCode 会话；用具体 ID 查特定会话）。
-- **搜索模式** (`--mode`)：
-  - `legacy`：旧版 grep 搜索（不依赖 SQLite）
-  - `lexical`：SQLite FTS5 全文检索（精确词法匹配）
-  - `vector`：sqlite-vec 向量语义检索（理解语义相似性）
-  - `hybrid`：混合模式，融合词法 + 向量结果（RRF 排序）
-  - `fallback`：默认模式，优先 SQLite，失败则回退 legacy
-- `search/timeline/get/stats` 支持 `--json` 输出结构化结果。
-- `ctx search --json` / `ctx timeline --json`：返回 `layer: "L0"`，每条结果是稳定的 L0 行（`id/ts/type/summary/source/layer`），并可能包含 `score`、`expand`（提示展开 `timeline/get` 的默认窗口与粗略 token 量级）。
-- `ctx search --json` 在 hybrid 模式下会附带 `retrieval`（如 `mode/lexical_hits/vector_hits/fused_hits/vector_engine`、`vector_fallback_reason`、可选 `ann_recall_probe`），并在每条结果附带 `match`（`lexical|vector|hybrid`）。
-- `ctx get --json`：返回 `layer: "L2"`，包含 `record`（完整记录，默认按 `--head` 做裁剪）与 `source`（hot|archive）。
-- `ctx stats`：文本输出会额外打印 `pack_breakdown_tokens(est)`；`--json` 会包含 `pack_breakdown`（各 section 的 token 估算）与 `session_id`。
-- `ctx save --json`：返回 `layer: "WRITE"`，包含 `action: "save_memory"` 与已写入记录的元数据（`id/ts/role/type/session_id/text_preview`）。
-- `ctx doctor --json`：诊断 SQLite 索引状态，包含 `sqlite_index.turns`、`sqlite_index.turns_fts`、`sqlite_index.vector.rows` 等信息。
-- `ctx metrics --json`：检索性能指标，包含 `lexical_engine`、`vector_engine`、`ann_recall_probe` 等。
-
-## 目录说明（用户视角）
-
-`.contextfs/` 下最常见的文件：
-
-- `pins.md`: 关键约束
-- `summary.md`: 历史压缩摘要
-- `state.json`: 运行时状态（如 lastSearchIndex、计数器、上次检索信息）
-- `history.ndjson`: 近期严格问答对（用户原问题 + 助手最终回答）
-- `history.archive.ndjson`: 归档历史
-- `history.embedding.hot.ndjson`: 热数据向量索引
-- `history.embedding.archive.ndjson`: 归档数据向量索引
-- `index.sqlite`: SQLite 索引数据库（FTS5 词法索引 + sqlite-vec 向量索引）
-- `retrieval.traces.ndjson`: 检索 trace（派生数据，可删可重建；可能轮转为 `retrieval.traces.N.ndjson`）
-
-## 常见问题
-
-### Q1: 会把中间推理过程写进 history 吗？
-不会。默认只记录用户原问题和助手最终回答。
-
-### Q2: 历史被压缩后还能找回来吗？
-可以。归档历史仍可通过 `search` / `timeline` / `get` 检索和回放（`get` 会自动做 archive fallback，`search/timeline` 直接基于 `history.archive.ndjson`）。`/ctx reindex` 负责 SQLite 索引重建：
-- `--full`：重建 FTS5 词法索引
-- `--vectors`：重建 sqlite-vec 向量索引
-- `--full --vectors`：同时重建两者
-
-### Q3: 会影响现有项目代码吗？
-不会。插件主要读写 `.contextfs/` 和插件目录，不会侵入业务代码。
-
-### Q4: 还能用 CLI 吗？
-可以。CLI 主要用于脚本化或调试；日常交互建议直接在对话框使用 `/ctx ...`。
-
-### Q5: SQLite 搜索需要安装什么依赖？
-需要安装 `better-sqlite3` 和 `sqlite-vec`：
-```bash
-cd .opencode/plugins/contextfs
-npm install better-sqlite3 sqlite-vec
-```
-如果未安装这些依赖，搜索会自动降级到 `legacy` 模式（基于 grep）。
-
-### Q6: 搜索模式怎么选择？
-- **`fallback`**（默认）：自动选择最佳可用模式，推荐日常使用
-- **`hybrid`**：词法 + 语义融合，最全面但需要配置 embedding
-- **`lexical`**：纯词法搜索，不需要 embedding，速度快
-- **`vector`**：纯语义搜索，需要配置 embedding API
-- **`legacy`**：兜底模式，不依赖 SQLite
-
-## MCP Server
-
-ContextFS now provides a local MCP stdio server in:
-
-- `.opencode/plugins/contextfs/mcp-server.mjs`
-
-Run it with:
+启动：
 
 ```bash
 node .opencode/plugins/contextfs/mcp-server.mjs --workspace <workspace-path>
 ```
 
-Exposed tools:
+工具：
 
 - `search(query, k?, scope?, session?|session_id?)`
 - `timeline(anchor_id, before?, after?, session?|session_id?)`
@@ -176,74 +128,134 @@ Exposed tools:
 - `save_memory(text, title?, role?, type?, session?|session_id?)`
 - `__IMPORTANT()`
 
-Contracts:
+---
 
-- `search/timeline` return L0 JSON (same shape as `ctx ... --json`)
-- `get` returns L2 JSON with the same `--head` budget semantics
-- `save_memory` returns WRITE JSON ack (same shape as `ctx save --json`)
+## 7. 配置
 
-## 配置
+默认配置在：`.opencode/plugins/contextfs/src/config.mjs`
 
-### SQLite 依赖
-
-启用 SQLite 搜索功能需要安装依赖：
+常用环境变量：
 
 ```bash
-cd .opencode/plugins/contextfs
-npm install better-sqlite3 sqlite-vec
+CONTEXTFS_EMBEDDING_BASE_URL=https://api.siliconflow.cn/v1
+CONTEXTFS_EMBEDDING_API_KEY=<your_api_key>
+CONTEXTFS_EMBEDDING_MODEL=Pro/BAAI/bge-m3
+CONTEXTFS_COMPACT_MODEL=Pro/Qwen/Qwen2.5-7B-Instruct
 ```
 
-### Embedding 配置
+说明：
 
-启用向量搜索需要配置 embedding API，复制模板并填入密钥：
-
-```bash
-cp .opencode/plugins/contextfs/.env.example .opencode/plugins/contextfs/.env
-# 编辑 .env，设置 CONTEXTFS_EMBEDDING_API_KEY
-```
-
-完整配置项参考 `.env.example` 文件。
-
-### 常用命令
+- 未安装可选 SQLite 依赖时，会自动降级到 `legacy`。
+- 若调整了 `text_preview` 生成策略，建议执行一次：
 
 ```text
-/ctx search "查询" --mode hybrid          # 混合搜索（默认 fallback）
-/ctx reindex --full --vectors             # 重建索引
-/ctx doctor --json                        # 诊断索引状态
-```
-
-## Benchmark
-
-1000 轮对话测试（avgChars=400, variance=0.6, seed=42）：
-
-### Token 控制
-
-| 指标 | ContextFS | Naive | 压缩率 |
-|:---|---:|---:|---:|
-| 最大 tokens | 1,360 | 104,851 | **98.7%** |
-| P95 tokens | 1,359 | 99,267 | **98.6%** |
-| 增长斜率 | 0.35/轮 | 105/轮 | **99.7%** |
-
-### 性能开销
-
-| 指标 | ContextFS | Naive |
-|:---|---:|---:|
-| 单轮耗时 P95 | 149 ms | 94 ms |
-| 总耗时 | 104 s | 60 s |
-| 压缩次数 | 15 | 0 |
-
-**结论**：ContextFS 实现 **O(1) token 增长**，以约 55ms/轮的额外开销换取 98.7% 的 token 压缩。
-
-## Lexical Index Notes
-
-- `summary` is kept as a compact L0/UI display field.
-- `text_preview` is used for lexical recall and stores a bounded segmented preview to retain more long-turn semantics.
-- If `text_preview` generation changes after upgrade, run one rebuild to backfill old rows:
-
-```bash
 /ctx reindex --full
 ```
 
-## License
+---
+
+## 8. 评估体系与实验结果
+
+ContextFS 现在包含三层评估：
+
+- 性能评估：`bench:full` 内含 `ContextFS vs Naive`
+- 检索评估：`bench:retrieval`（Recall@k / MRR@k / nDCG@k）
+- 任务评估：`bench:task`（规则优先，灰区可接 LLM Judge）
+
+### 8.1 评估命令
+
+```bash
+npm run bench:retrieval
+npm run bench:task
+npm run bench:full
+```
+
+### 8.2 最近一次全量评估（2026-02-23）
+
+执行命令：
+
+```bash
+npm run bench:full -- --turns 300 --threshold 1000000 --outDir bench/results_full
+```
+
+> 注：该次 run 使用高阈值避免触发在线 compact API，主要用于性能/检索/任务一致性验证。
+
+#### 性能（ContextFS vs Naive）
+
+| 指标 | ContextFS | Naive | 变化 |
+|---|---:|---:|---:|
+| pack_tokens max | 556 | 21,947 | -97.47% |
+| pack_tokens p95 | 556 | 20,721 | -97.32% |
+| turn_time p95 (ms) | 136.413 | 99.145 | +37.59% |
+| total_elapsed_ms | 27,240 | 21,918 | +24.28% |
+
+解读：ContextFS 以可接受时延开销换取稳定 token 上界。
+
+#### 检索（300 样本）
+
+| 模式 | Recall@k | MRR@k | nDCG@k |
+|---|---:|---:|---:|
+| legacy | 0.903 | 0.902 | 0.902 |
+| lexical | 1.000 | 1.000 | 1.000 |
+| vector | 0.903 | 0.902 | 0.902 |
+| hybrid | 1.000 | 1.000 | 1.000 |
+| fallback | 1.000 | 1.000 | 1.000 |
+
+解读：在该数据集上 `hybrid/lexical/fallback` 达到满分，`legacy` 略弱。
+
+#### 任务（150 样本）
+
+- `task_success_rate = 1.0`
+- `task_partial_rate = 0`
+- `critical_fact_miss_rate = 0`
+- `judge.total_calls = 0`（本次样本由规则层直接通过）
+
+解读：在当前数据与参数下，检索证据覆盖足够，规则判分可直接通过。
+
+### 8.3 LLM Judge 说明
+
+当任务处于灰区（例如 `k=1` 导致证据不全）时，会触发 Judge。
+
+默认使用：
+
+- Base URL：`https://api.siliconflow.cn/v1`
+- 模型：由 `bench/lib/judge_client.mjs` 的默认值或 `--judge-model` 决定
+- API key：复用 `.env` 中 `CONTEXTFS_EMBEDDING_API_KEY`
+
+---
+
+## 9. 开发与测试
+
+安装：
+
+```bash
+npm install
+npm install --prefix .opencode/plugins/contextfs
+```
+
+测试：
+
+```bash
+npm run test:contextfs:unit
+npm run test:contextfs:regression
+node --test --test-isolation=none bench/bench.test.mjs bench/eval.test.mjs
+```
+
+---
+
+## 10. 常见问题
+
+### Q1. 压缩后还能检索历史吗？
+可以。归档历史仍可通过 `search/timeline/get` 检索，`get` 支持 archive fallback。
+
+### Q2. 未安装 SQLite 依赖怎么办？
+会自动回退到 `legacy`，不阻塞基础功能。
+
+### Q3. 为什么某次 bench 触发 compact 报 key 缺失？
+该 run 触发了在线 compact 调用，但进程没有有效 `CONTEXTFS_EMBEDDING_API_KEY`。可设置 key 或提高 threshold 避免触发。
+
+---
+
+## 11. License
 
 MIT

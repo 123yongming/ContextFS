@@ -1,0 +1,80 @@
+{
+  "generated_at": "2026-02-23T12:22:34.573Z",
+  "params": {
+    "turns": 300,
+    "orders": 1,
+    "avgChars": 280,
+    "variance": 0.5,
+    "seed": 42,
+    "threshold": 1000000,
+    "recentN": null,
+    "outDir": "D:\\code\\python_code\\ContextFS\\bench\\results_full",
+    "judgeEnabled": true,
+    "judgeModel": "",
+    "judgeBaseUrl": "",
+    "modes": [
+      "legacy",
+      "lexical",
+      "vector",
+      "hybrid",
+      "fallback"
+    ]
+  },
+  "dataset": {
+    "samples": 300,
+    "hot_samples": 225,
+    "archive_samples": 75
+  },
+  "modes": {
+    "legacy": {
+      "samples": 300,
+      "recall_at_k": 0.903,
+      "mrr_at_k": 0.902,
+      "ndcg_at_k": 0.902,
+      "coverage": 0.903,
+      "p95_latency_ms": 42.272,
+      "avg_latency_ms": 29.003,
+      "errors": 0
+    },
+    "lexical": {
+      "samples": 300,
+      "recall_at_k": 1,
+      "mrr_at_k": 1,
+      "ndcg_at_k": 1,
+      "coverage": 1,
+      "p95_latency_ms": 53.246,
+      "avg_latency_ms": 40.11,
+      "errors": 0
+    },
+    "vector": {
+      "samples": 300,
+      "recall_at_k": 0.903,
+      "mrr_at_k": 0.902,
+      "ndcg_at_k": 0.902,
+      "coverage": 0.903,
+      "p95_latency_ms": 50.967,
+      "avg_latency_ms": 37.68,
+      "errors": 0
+    },
+    "hybrid": {
+      "samples": 300,
+      "recall_at_k": 1,
+      "mrr_at_k": 1,
+      "ndcg_at_k": 1,
+      "coverage": 1,
+      "p95_latency_ms": 63.906,
+      "avg_latency_ms": 47.649,
+      "errors": 0
+    },
+    "fallback": {
+      "samples": 300,
+      "recall_at_k": 1,
+      "mrr_at_k": 1,
+      "ndcg_at_k": 1,
+      "coverage": 1,
+      "p95_latency_ms": 64.915,
+      "avg_latency_ms": 48.283,
+      "errors": 0
+    }
+  }
+}
